@@ -475,6 +475,16 @@ def auth_status():
     })
 
 
+@app.route("/auth/launch")
+def auth_launch():
+    """Genera PKCE, guarda el verifier y redirige directo al login de Auth0."""
+    verifier, challenge, state_val = _pkce_generate()
+    with _state_lock:
+        _state["pkce_verifier"] = verifier
+    auth_url = _build_auth_url(verifier, challenge, state_val)
+    return redirect(auth_url, code=302)
+
+
 @app.route("/auth/browser-url")
 def auth_browser_url():
     """Genera la URL de Auth0 para el flujo OAuth web (cloud)."""
@@ -1133,20 +1143,11 @@ function toggleEmail(){
 }
 
 // ── Cloud: web OAuth ────────────────────────────────────────────────────────
-async function startWebOAuth(){
-  // Abrir la ventana ANTES del await para evitar que el browser bloquee el popup
-  const popup = window.open('', '_blank');
+function startWebOAuth(){
+  // Abrir /auth/launch directamente — el servidor genera el PKCE y redirige a Auth0
+  window.open('/auth/launch', '_blank');
   document.getElementById('webBtn').disabled = true;
-  setStatus('<span class="spinner"></span> Generando URL...', '');
-  const d = await apiFetch('/auth/browser-url');
-  if(!d.ok){
-    if(popup) popup.close();
-    setStatus('❌ '+d.msg, 'err');
-    document.getElementById('webBtn').disabled=false;
-    return;
-  }
-  if(popup) popup.location.href = d.url;
-  document.getElementById('sharkLoginLink').href = d.url;
+  document.getElementById('sharkLoginLink').href = '/auth/launch';
   document.getElementById('step-launch').style.display = 'none';
   document.getElementById('step-paste').style.display = 'block';
   setStatus('', '');
