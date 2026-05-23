@@ -59,6 +59,7 @@ _state = {
     "map_ts":  None,         # timestamp de la última carga
     "login_status": "",      # mensaje para la pantalla de login
     "login_in_progress": False,
+    "pkce_verifier": None,   # para OAuth web
 }
 _state_lock = threading.Lock()
 
@@ -279,7 +280,8 @@ def login_page():
         return redirect(url_for("dashboard"))
     resp = make_response(render_template_string(LOGIN_HTML,
         status=_state["login_status"],
-        in_progress=False))   # nunca auto-arrancar
+        in_progress=False,
+        is_cloud=bool(CLOUD)))   # nunca auto-arrancar
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     return resp
@@ -471,6 +473,151 @@ def auth_status():
         "in_progress": _state["login_in_progress"],
         "msg":         _state["login_status"],
     })
+
+
+@app.route("/auth/browser-url")
+def auth_browser_url():
+    """Genera la URL de Auth0 para el flujo OAuth web (cloud)."""
+    verifier, challenge, state_val = _pkce_generate()
+    with _state_lock:
+        _state["pkce_verifier"] = verifier
+    auth_url = _build_auth_url(verifier, challenge, state_val)
+    return jsonify({"ok": True, "url": auth_url})
+
+
+@app.route("/auth/browser-code", methods=["POST"])
+def auth_browser_code():
+    """Recibe la URL de redirección copiada del navegador y completa el login."""
+    if _state["login_in_progress"]:
+        return jsonify({"ok": False, "msg": "Login ya en progreso"})
+
+    data = request.get_json(force=True) or {}
+    redirect_url = (data.get("redirect_url") or "").strip()
+
+    verifier = _state.get("pkce_verifier")
+    if not verifier:
+        return jsonify({"ok": False, "msg": "Sesión expirada — obtené una nueva URL."})
+
+    # Extraer code de la URL de redirección (esquema com.sharkninja.shark://...?code=...)
+    code = None
+    try:
+        if "?" in redirect_url:
+            query_str = redirect_url.split("?", 1)[1]
+            params = urllib.parse.parse_qs(query_str)
+            code = params.get("code", [None])[0]
+    except Exception:
+        pass
+
+    if not code:
+        return jsonify({"ok": False, "msg": "URL inválida — no se encontró el código. Copiá la URL completa."})
+
+    with _state_lock:
+        _state["login_in_progress"] = True
+        _state["login_status"] = "⏳ Autenticando con Shark..."
+        _state["pkce_verifier"] = None
+
+    def _do_web():
+        try:
+            import aiohttp as _aiohttp
+            async def _exchange():
+                sess = _aiohttp.ClientSession()
+                try:
+                    token_payload = {
+                        "grant_type": "authorization_code",
+                        "client_id": AUTH0_CLIENT_ID,
+                        "code": code,
+                        "redirect_uri": AUTH0_REDIRECT_URI,
+                        "code_verifier": verifier,
+                    }
+                    async with sess.post(AUTH0_TOKEN_URL, json=token_payload) as r:
+                        token_data = await r.json()
+                    id_token = token_data.get("id_token")
+                    if not id_token:
+                        raise RuntimeError(f"Sin id_token: {token_data}")
+                    ayla_payload = {
+                        "app_id": SHARK_APP_ID,
+                        "app_secret": SHARK_APP_SECRET,
+                        "token": id_token,
+                    }
+                    async with sess.post(f"{LOGIN_URL}/api/v1/token_sign_in",
+                                         json=ayla_payload,
+                                         headers={"Content-Type": "application/json",
+                                                  "User-Agent": "Mozilla/5.0"}) as r:
+                        ayla_data = await r.json()
+                    if "access_token" not in ayla_data:
+                        raise RuntimeError(f"Sin access_token: {ayla_data}")
+                    return sess, id_token, token_data, ayla_data
+                except Exception:
+                    await sess.close()
+                    raise
+
+            sess, id_token, token_data, ayla_data = _run_async(_exchange())
+
+            from datetime import timezone
+            tokens = {
+                "auth0_id_token":      id_token,
+                "auth0_refresh_token": token_data.get("refresh_token"),
+                "auth0_access_token":  token_data.get("access_token"),
+                "auth0_expiry":        (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=token_data.get("expires_in", 86400))
+                ).isoformat(),
+                "ayla_access_token":   ayla_data["access_token"],
+                "ayla_refresh_token":  ayla_data.get("refresh_token"),
+            }
+            _save_tokens(tokens)
+
+            api = get_ayla_api("", "", websession=sess)
+            api._auth0_id_token  = id_token
+            api._access_token    = ayla_data["access_token"]
+            api._refresh_token   = ayla_data.get("refresh_token")
+            api._auth_expiration = datetime.now() + timedelta(hours=1)
+            api._is_authed       = True
+
+            vacuums = []
+            try:
+                vacuums = _run_async(api.async_get_devices(update=False))
+                for v in vacuums:
+                    try: _run_async(v.async_update())
+                    except: pass
+            except: pass
+
+            if not vacuums:
+                from sharkiq import SkegoxApi, SkegoxAuthManager, SkegoxDevice
+                from sharkiq.const import REGION_ELSEWHERE
+                token_store = {
+                    "auth0_id_token":      id_token,
+                    "auth0_refresh_token": token_data.get("refresh_token"),
+                    "auth0_access_token":  token_data.get("access_token"),
+                    "auth0_expiry":        tokens["auth0_expiry"],
+                }
+                skegox_auth = SkegoxAuthManager("", "", region=REGION_ELSEWHERE, token_store=token_store)
+                skegox_api  = SkegoxApi(skegox_auth)
+                _run_async(skegox_api.discover())
+                device_dicts = _run_async(skegox_api.get_all_devices())
+                if device_dicts:
+                    vacuums = [_SkegoxWrapper(SkegoxDevice(skegox_api, d), skegox_api) for d in device_dicts]
+                    api = skegox_api
+
+            with _state_lock:
+                _state["api"]        = api
+                _state["vacuums"]    = vacuums
+                _state["vacuum"]     = vacuums[0] if vacuums else None
+                _state["authed"]     = bool(vacuums)
+                _state["login_in_progress"] = False
+                _state["login_status"] = (
+                    f"✓ Conectado — {vacuums[0].name}" if vacuums
+                    else "❌ No se encontraron robots."
+                )
+            if vacuums:
+                _refresh_state()
+        except Exception as exc:
+            with _state_lock:
+                _state["login_status"] = f"❌ Error: {str(exc)[:120]}"
+                _state["login_in_progress"] = False
+
+    threading.Thread(target=_do_web, daemon=True).start()
+    return jsonify({"ok": True})
 
 
 @app.route("/auth/email", methods=["POST"])
@@ -892,12 +1039,16 @@ LOGIN_HTML = """<!DOCTYPE html>
   .btn-ghost{background:transparent;color:#5E7E9A;font-size:13px;padding:8px;
              border:1px solid #1B2C40;border-radius:8px;cursor:pointer;width:100%;margin-top:4px}
   .btn-ghost:hover{border-color:#2896FF;color:#2896FF}
-  .hint{font-size:12px;color:#3A5770;line-height:1.5;margin-bottom:16px}
+  .hint{font-size:12px;color:#3A5770;line-height:1.5;margin-bottom:16px;text-align:left}
+  .steps{text-align:left;color:#5E7E9A;font-size:13px;padding-left:18px;
+         line-height:2;margin:10px 0 14px}
+  .steps li{padding-left:4px}
   .divider{display:flex;align-items:center;gap:10px;margin:16px 0;color:#3A5770;font-size:12px}
   .divider::before,.divider::after{content:'';flex:1;height:1px;background:#1B2C40}
   .field{width:100%;background:#070D18;border:1px solid #1B2C40;border-radius:8px;
          padding:12px 14px;font-size:14px;color:#E8F3FF;margin-bottom:10px;outline:none}
   .field:focus{border-color:#2896FF}
+  textarea.field{font-size:11px;font-family:monospace;resize:none;line-height:1.4}
   .status{min-height:36px;font-size:13px;color:#5E7E9A;margin-top:14px;line-height:1.5;word-break:break-word}
   .status.err{color:#FF4040}
   .status.ok{color:#00C878}
@@ -906,6 +1057,7 @@ LOGIN_HTML = """<!DOCTYPE html>
            vertical-align:middle;margin-right:5px}
   @keyframes spin{to{transform:rotate(360deg)}}
   #emailForm{display:none;text-align:left}
+  a{color:#2896FF}
 </style>
 </head>
 <body>
@@ -914,16 +1066,52 @@ LOGIN_HTML = """<!DOCTYPE html>
   <h1>Shark IQ</h1>
   <p class="sub">Controlador de robot aspirador</p>
 
-  <!-- Opción 1: Navegador del PC -->
+{% if is_cloud %}
+  <!-- ── MODO CLOUD: OAuth web ── -->
+  <div id="step-launch">
+    <button class="btn btn-primary" id="webBtn" onclick="startWebOAuth()">
+      🔐 Iniciar sesión con Shark
+    </button>
+    <p class="hint" style="text-align:center">Se abrirá la página oficial de Shark en una nueva pestaña.<br>
+      <strong style="color:#FFD700">Si estás en el celular, hacé esto desde una PC.</strong></p>
+
+    <div class="divider">o</div>
+    <button class="btn-ghost" onclick="toggleEmail()">📧 Intentar con email</button>
+    <div id="emailForm">
+      <br>
+      <input class="field" type="email" id="emailInp" placeholder="Email" autocomplete="email">
+      <input class="field" type="password" id="passInp" placeholder="Contraseña" autocomplete="current-password">
+      <button class="btn btn-primary" id="emailBtn" onclick="startEmail()">Conectar</button>
+    </div>
+  </div>
+
+  <!-- Paso 2: pegar URL de redirección -->
+  <div id="step-paste" style="display:none">
+    <p style="font-size:13px;font-weight:700;color:#E8F3FF;margin-bottom:8px;text-align:left">Pasos:</p>
+    <ol class="steps">
+      <li>Abrí el <a id="sharkLoginLink" href="#" target="_blank">Shark Login ↗</a></li>
+      <li>Ingresá con tu cuenta Shark</li>
+      <li>El navegador mostrará un error — <strong style="color:#E8F3FF">copiá la URL</strong> de la barra de direcciones</li>
+      <li>Pegala acá:</li>
+    </ol>
+    <textarea class="field" id="redirectUrlInp" rows="3"
+      placeholder="com.sharkninja.shark://..."
+      oninput="document.getElementById('continueBtn').disabled=!this.value.trim()"></textarea>
+    <button class="btn btn-primary" id="continueBtn" onclick="submitCode()" disabled>
+      Continuar →
+    </button>
+    <button class="btn-ghost" style="margin-top:6px" onclick="resetOAuth()">← Volver</button>
+  </div>
+
+{% else %}
+  <!-- ── MODO LOCAL: navegador del PC ── -->
   <button class="btn btn-primary" id="loginBtn" onclick="startBrowser()">
     🖥️ Iniciar sesión en el PC
   </button>
-  <p class="hint">Se abrirá una ventana en el PC para autenticarte.<br>
+  <p class="hint" style="text-align:center">Se abrirá una ventana en el PC para autenticarte.<br>
     <strong style="color:#E8F3FF">Fijate en el escritorio del PC</strong> cuando hagas clic.</p>
 
   <div class="divider">o</div>
-
-  <!-- Opción 2: Email + contraseña -->
   <button class="btn-ghost" onclick="toggleEmail()">📧 Iniciar sesión con email</button>
   <div id="emailForm">
     <br>
@@ -931,6 +1119,7 @@ LOGIN_HTML = """<!DOCTYPE html>
     <input class="field" type="password" id="passInp" placeholder="Contraseña" autocomplete="current-password">
     <button class="btn btn-primary" id="emailBtn" onclick="startEmail()">Conectar</button>
   </div>
+{% endif %}
 
   <div class="status" id="status">{{ status }}</div>
 </div>
@@ -943,45 +1132,90 @@ function toggleEmail(){
   document.getElementById('emailForm').style.display = emailVisible ? 'block' : 'none';
 }
 
+// ── Cloud: web OAuth ────────────────────────────────────────────────────────
+async function startWebOAuth(){
+  document.getElementById('webBtn').disabled = true;
+  setStatus('<span class="spinner"></span> Generando URL...', '');
+  const d = await apiFetch('/auth/browser-url');
+  if(!d.ok){ setStatus('❌ '+d.msg, 'err'); document.getElementById('webBtn').disabled=false; return; }
+  document.getElementById('sharkLoginLink').href = d.url;
+  document.getElementById('step-launch').style.display = 'none';
+  document.getElementById('step-paste').style.display = 'block';
+  setStatus('', '');
+  window.open(d.url, '_blank');
+}
+
+function resetOAuth(){
+  document.getElementById('step-launch').style.display = 'block';
+  document.getElementById('step-paste').style.display = 'none';
+  document.getElementById('webBtn').disabled = false;
+  document.getElementById('redirectUrlInp').value = '';
+  document.getElementById('continueBtn').disabled = true;
+  setStatus('', '');
+}
+
+async function submitCode(){
+  const redirectUrl = document.getElementById('redirectUrlInp').value.trim();
+  if(!redirectUrl){ setStatus('Pegá la URL primero', 'err'); return; }
+  document.getElementById('continueBtn').disabled = true;
+  setStatus('<span class="spinner"></span> Verificando...', '');
+  polling = true;
+  const d = await apiFetch('/auth/browser-code','POST',{redirect_url:redirectUrl});
+  if(!d.ok){ setStatus('❌ '+d.msg,'err'); document.getElementById('continueBtn').disabled=false; polling=false; return; }
+  poll();
+}
+
+// ── Local: navegador del PC ─────────────────────────────────────────────────
 function startBrowser(){
   document.getElementById('loginBtn').disabled = true;
   setStatus('<span class="spinner"></span> Abriendo navegador en el PC...', '');
   polling = true;
-  fetch('/auth/start', {method:'POST'}).then(()=>poll());
+  apiFetch('/auth/start','POST').then(()=>poll());
 }
 
+// ── Email ───────────────────────────────────────────────────────────────────
 function startEmail(){
   const email = document.getElementById('emailInp').value.trim();
   const pass  = document.getElementById('passInp').value;
   if(!email || !pass){ setStatus('Completa email y contraseña', 'err'); return; }
-  document.getElementById('loginBtn').disabled = true;
+  const lb = document.getElementById('loginBtn'); if(lb) lb.disabled = true;
   document.getElementById('emailBtn').disabled = true;
   setStatus('<span class="spinner"></span> Verificando credenciales...', '');
   polling = true;
-  fetch('/auth/email',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({email,password:pass})}).then(()=>poll());
+  apiFetch('/auth/email','POST',{email,password:pass}).then(()=>poll());
 }
 
+// ── Polling ─────────────────────────────────────────────────────────────────
 function poll(){
   if(!polling) return;
-  fetch('/auth/status').then(r=>r.json()).then(d=>{
+  apiFetch('/auth/status').then(d=>{
     if(d.authed){ window.location='/dashboard'; return; }
     const cls = d.msg.startsWith('❌') ? 'err' : d.msg.startsWith('✓') ? 'ok' : '';
     setStatus(d.in_progress ? '<span class="spinner"></span> '+d.msg : d.msg, cls);
     if(d.in_progress || (!d.authed && !d.msg.startsWith('❌'))){
       setTimeout(poll, 1500);
     } else {
-      document.getElementById('loginBtn').disabled = false;
-      const eb = document.getElementById('emailBtn');
-      if(eb) eb.disabled = false;
+      ['webBtn','loginBtn','emailBtn','continueBtn'].forEach(id=>{
+        const el=document.getElementById(id); if(el) el.disabled=false;
+      });
       polling = false;
     }
   }).catch(()=>setTimeout(poll, 2000));
 }
+
 function setStatus(html, cls){
   const el = document.getElementById('status');
   el.innerHTML = html;
   el.className = 'status ' + (cls||'');
+}
+
+async function apiFetch(url, method='GET', body=null){
+  try {
+    const opts = { method, headers: {'Content-Type':'application/json'} };
+    if(body) opts.body = JSON.stringify(body);
+    const r = await fetch(url, opts);
+    return await r.json();
+  } catch(e){ return {ok:false, msg:String(e)}; }
 }
 {% if in_progress %}
 window.onload = function(){ startBrowser(); };
