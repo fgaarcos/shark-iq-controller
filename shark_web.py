@@ -1134,15 +1134,22 @@ function toggleEmail(){
 
 // ── Cloud: web OAuth ────────────────────────────────────────────────────────
 async function startWebOAuth(){
+  // Abrir la ventana ANTES del await para evitar que el browser bloquee el popup
+  const popup = window.open('', '_blank');
   document.getElementById('webBtn').disabled = true;
   setStatus('<span class="spinner"></span> Generando URL...', '');
   const d = await apiFetch('/auth/browser-url');
-  if(!d.ok){ setStatus('❌ '+d.msg, 'err'); document.getElementById('webBtn').disabled=false; return; }
+  if(!d.ok){
+    if(popup) popup.close();
+    setStatus('❌ '+d.msg, 'err');
+    document.getElementById('webBtn').disabled=false;
+    return;
+  }
+  if(popup) popup.location.href = d.url;
   document.getElementById('sharkLoginLink').href = d.url;
   document.getElementById('step-launch').style.display = 'none';
   document.getElementById('step-paste').style.display = 'block';
   setStatus('', '');
-  window.open(d.url, '_blank');
 }
 
 function resetOAuth(){
