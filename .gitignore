@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+shark_web_tokens.json
+shark_debug.log
+*.log
+.env
+shark_logo_b64.txt
+shark_logo.png
+shark_logo.svg
