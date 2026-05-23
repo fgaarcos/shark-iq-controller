@@ -60,6 +60,7 @@ _state = {
     "login_status": "",      # mensaje para la pantalla de login
     "login_in_progress": False,
     "pkce_verifier": None,   # para OAuth web
+    "pkce_redirect_uri": None,  # redirect URI usado en el último /auth/launch
 }
 _state_lock = threading.Lock()
 
@@ -86,7 +87,7 @@ def _pkce_generate():
     return verifier, challenge, state_val
 
 
-def _build_auth_url(verifier, challenge, state_val):
+def _build_auth_url(verifier, challenge, state_val, override_redirect=None):
     params = {
         "os": "ios",
         "response_type": "code",
@@ -94,7 +95,7 @@ def _build_auth_url(verifier, challenge, state_val):
         "client_id": AUTH0_CLIENT_ID,
         "state": state_val,
         "scope": AUTH0_SCOPES,
-        "redirect_uri": AUTH0_REDIRECT_URI,
+        "redirect_uri": override_redirect or AUTH0_REDIRECT_URI,
         "code_challenge": challenge,
         "screen_hint": "signin",
         "code_challenge_method": "S256",
@@ -479,10 +480,205 @@ def auth_status():
 def auth_launch():
     """Genera PKCE, guarda el verifier y redirige directo al login de Auth0."""
     verifier, challenge, state_val = _pkce_generate()
+    if CLOUD:
+        # Intentar usar nuestro propio servidor como callback (funciona si Auth0 lo acepta)
+        web_uri = request.url_root.rstrip('/') + '/auth/callback'
+        with _state_lock:
+            _state["pkce_verifier"]     = verifier
+            _state["pkce_redirect_uri"] = web_uri
+        auth_url = _build_auth_url(verifier, challenge, state_val, override_redirect=web_uri)
+    else:
+        with _state_lock:
+            _state["pkce_verifier"]     = verifier
+            _state["pkce_redirect_uri"] = AUTH0_REDIRECT_URI
+        auth_url = _build_auth_url(verifier, challenge, state_val)
+    return redirect(auth_url, code=302)
+
+
+@app.route("/auth/launch-fallback")
+def auth_launch_fallback():
+    """Igual que /auth/launch pero usa la URI mobile original (para Firefox)."""
+    verifier, challenge, state_val = _pkce_generate()
     with _state_lock:
-        _state["pkce_verifier"] = verifier
+        _state["pkce_verifier"]     = verifier
+        _state["pkce_redirect_uri"] = AUTH0_REDIRECT_URI
     auth_url = _build_auth_url(verifier, challenge, state_val)
     return redirect(auth_url, code=302)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    """Auth0 redirige aquí con el código de autorización (flujo web)."""
+    error = request.args.get("error")
+    code  = request.args.get("code")
+
+    if error or not code:
+        msg = request.args.get("error_description", error or "No se recibió código")
+        fallback_url = request.url_root.rstrip('/') + '/auth/launch-fallback'
+        return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Shark IQ</title>
+<style>*{{box-sizing:border-box;margin:0;padding:0}}body{{background:#070D18;color:#E8F3FF;
+font-family:'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;
+min-height:100vh;padding:20px}}.c{{background:#0C1520;border:1px solid #1B2C40;border-radius:16px;
+padding:32px 24px;max-width:380px;text-align:center}}a{{color:#2896FF}}code{{color:#AAD4FF;
+font-size:11px}}</style></head><body><div class="c">
+<p style="font-size:28px;margin-bottom:10px">&#10060;</p>
+<p style="font-weight:700;margin-bottom:8px">Auth0 no aceptó la redirecci&oacute;n</p>
+<p style="color:#5E7E9A;font-size:13px;margin-bottom:16px">{msg}</p>
+<p style="font-size:13px;color:#5E7E9A">Cerrá esta pestaña, abrí <strong>Firefox</strong>
+y andá a:<br><a href="{fallback_url}" target="_blank" style="font-size:12px">/auth/launch-fallback</a><br><br>
+Después copiá la URL que aparece en la barra de Firefox<br>(empieza con <code>com.sharkninja.shark://</code>)
+y pegala en la pestaña principal de Shark IQ.</p>
+</div></body></html>""", 400
+
+    with _state_lock:
+        verifier     = _state.get("pkce_verifier")
+        redirect_uri = _state.get("pkce_redirect_uri") or (request.url_root.rstrip('/') + '/auth/callback')
+        if verifier:
+            _state["pkce_verifier"] = None
+        if _state["login_in_progress"]:
+            return _CALLBACK_WAITING_HTML
+        _state["login_in_progress"] = True
+        _state["login_status"] = "\u23f3 Autenticando..."
+
+    if not verifier:
+        return "<p style='font-family:sans-serif;padding:20px'>Sesi&oacute;n expirada &mdash; cerrá esta pestaña y reintentá</p>", 400
+
+    def _do_callback():
+        try:
+            import aiohttp as _aiohttp
+            async def _exchange():
+                sess = _aiohttp.ClientSession()
+                try:
+                    token_payload = {
+                        "grant_type": "authorization_code",
+                        "client_id": AUTH0_CLIENT_ID,
+                        "code": code,
+                        "redirect_uri": redirect_uri,
+                        "code_verifier": verifier,
+                    }
+                    async with sess.post(AUTH0_TOKEN_URL, json=token_payload) as r:
+                        token_data = await r.json()
+                    id_token = token_data.get("id_token")
+                    if not id_token:
+                        raise RuntimeError(f"Sin id_token: {token_data}")
+                    ayla_payload = {
+                        "app_id": SHARK_APP_ID,
+                        "app_secret": SHARK_APP_SECRET,
+                        "token": id_token,
+                    }
+                    async with sess.post(f"{LOGIN_URL}/api/v1/token_sign_in",
+                                         json=ayla_payload,
+                                         headers={"Content-Type": "application/json",
+                                                  "User-Agent": "Mozilla/5.0"}) as r:
+                        ayla_data = await r.json()
+                    if "access_token" not in ayla_data:
+                        raise RuntimeError(f"Sin access_token: {ayla_data}")
+                    return sess, id_token, token_data, ayla_data
+                except Exception:
+                    await sess.close()
+                    raise
+
+            sess, id_token, token_data, ayla_data = _run_async(_exchange())
+
+            from datetime import timezone
+            tokens = {
+                "auth0_id_token":      id_token,
+                "auth0_refresh_token": token_data.get("refresh_token"),
+                "auth0_access_token":  token_data.get("access_token"),
+                "auth0_expiry":        (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=token_data.get("expires_in", 86400))
+                ).isoformat(),
+                "ayla_access_token":  ayla_data["access_token"],
+                "ayla_refresh_token": ayla_data.get("refresh_token"),
+            }
+            _save_tokens(tokens)
+
+            api = get_ayla_api("", "", websession=sess)
+            api._auth0_id_token  = id_token
+            api._access_token    = ayla_data["access_token"]
+            api._refresh_token   = ayla_data.get("refresh_token")
+            api._auth_expiration = datetime.now() + timedelta(hours=1)
+            api._is_authed       = True
+
+            vacuums = []
+            try:
+                vacuums = _run_async(api.async_get_devices(update=False))
+                for v in vacuums:
+                    try: _run_async(v.async_update())
+                    except: pass
+            except: pass
+
+            if not vacuums:
+                from sharkiq import SkegoxApi, SkegoxAuthManager, SkegoxDevice
+                from sharkiq.const import REGION_ELSEWHERE
+                token_store = {
+                    "auth0_id_token":      id_token,
+                    "auth0_refresh_token": token_data.get("refresh_token"),
+                    "auth0_access_token":  token_data.get("access_token"),
+                    "auth0_expiry":        tokens["auth0_expiry"],
+                }
+                skegox_auth = SkegoxAuthManager("", "", region=REGION_ELSEWHERE, token_store=token_store)
+                skegox_api  = SkegoxApi(skegox_auth)
+                _run_async(skegox_api.discover())
+                device_dicts = _run_async(skegox_api.get_all_devices())
+                if device_dicts:
+                    vacuums = [_SkegoxWrapper(SkegoxDevice(skegox_api, d), skegox_api) for d in device_dicts]
+                    api = skegox_api
+
+            with _state_lock:
+                _state["api"]        = api
+                _state["vacuums"]    = vacuums
+                _state["vacuum"]     = vacuums[0] if vacuums else None
+                _state["authed"]     = bool(vacuums)
+                _state["login_in_progress"] = False
+                _state["login_status"] = (
+                    f"\u2713 Conectado \u2014 {vacuums[0].name}" if vacuums
+                    else "\u274c No se encontraron robots."
+                )
+            if vacuums:
+                _refresh_state()
+        except Exception as exc:
+            with _state_lock:
+                _state["login_status"] = f"\u274c Error: {str(exc)[:120]}"
+                _state["login_in_progress"] = False
+
+    threading.Thread(target=_do_callback, daemon=True).start()
+    return _CALLBACK_WAITING_HTML
+
+
+# HTML minimo para la pestaña de callback
+_CALLBACK_WAITING_HTML = """<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Shark IQ \u2014 Auth</title><style>*{box-sizing:border-box;margin:0;padding:0}
+body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',sans-serif;
+display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.c{background:#0C1520;border:1px solid #1B2C40;border-radius:16px;
+padding:32px 24px;max-width:320px;text-align:center}
+.sp{display:inline-block;width:32px;height:32px;border:3px solid #1B2C40;
+border-top-color:#2896FF;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:16px}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style></head><body><div class="c">
+<div class="sp"></div>
+<p style="font-size:16px;font-weight:700" id="ttl">Completando autenticaci&#xf3;n...</p>
+<p style="color:#5E7E9A;font-size:13px;margin-top:8px" id="msg">Podés cerrar esta pesta&#xf1;a cuando termine</p>
+</div>
+<script>
+function poll(){
+  fetch('/auth/status').then(r=>r.json()).then(d=>{
+    if(d.authed){
+      document.querySelector('.sp').style.display='none';
+      document.getElementById('ttl').textContent='\u2705 Login completado';
+      document.getElementById('msg').textContent='Volvé a la pestaña de Shark IQ';
+      setTimeout(()=>window.close(),2000);
+    } else if(d.msg && d.msg.startsWith('\u274c')){
+      document.querySelector('.sp').style.display='none';
+      document.getElementById('ttl').textContent=d.msg;
+      document.getElementById('msg').textContent='Cerrá esta pestaña y reintentá';
+    } else { setTimeout(poll,1000); }
+  }).catch(()=>setTimeout(poll,1500));
+}
+setTimeout(poll,600);
+</script></body></html>"""
 
 
 @app.route("/auth/browser-url")
@@ -1100,11 +1296,14 @@ LOGIN_HTML = """<!DOCTYPE html>
 
   <!-- Paso 2: pegar URL de redirección -->
   <div id="step-paste" style="display:none">
-    <p style="font-size:13px;font-weight:700;color:#E8F3FF;margin-bottom:8px;text-align:left">Pasos:</p>
+    <p style="font-size:13px;font-weight:700;color:#E8F3FF;margin-bottom:8px;text-align:left">
+      Si Auth0 te redirigió a nuestro servidor → <span style="color:#00C878">el login se completa solo</span>, cerrá esa pestaña.</p>
+    <p style="font-size:13px;font-weight:700;color:#E8F3FF;margin-top:12px;margin-bottom:8px;text-align:left">
+      Si la pestaña de Shark mostró un error o no pasó nada:</p>
     <ol class="steps">
-      <li>Abrí el <a id="sharkLoginLink" href="#" target="_blank">Shark Login ↗</a></li>
-      <li>Ingresá con tu cuenta Shark</li>
-      <li>El navegador mostrará un error — <strong style="color:#E8F3FF">copiá la URL</strong> de la barra de direcciones</li>
+      <li>Abrí en <strong style="color:#FFD700">Firefox</strong>: <a href="/auth/launch-fallback" target="_blank" id="sharkLoginLink">Shark Login (Firefox) ↗</a></li>
+      <li>Iniciá sesión con tu cuenta Shark</li>
+      <li>Firefox mostrará un error — copiá la <strong style="color:#E8F3FF">URL completa</strong> de la barra de direcciones</li>
       <li>Pegala acá:</li>
     </ol>
     <textarea class="field" id="redirectUrlInp" rows="3"
