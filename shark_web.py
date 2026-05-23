@@ -1079,9 +1079,12 @@ LOGIN_HTML = """<!DOCTYPE html>
 {% if is_cloud %}
   <!-- ── MODO CLOUD: OAuth web ── -->
   <div id="step-launch">
-    <button class="btn btn-primary" id="webBtn" onclick="startWebOAuth()">
+    <a href="/auth/launch" target="_blank" rel="noopener"
+       class="btn btn-primary" id="webBtn"
+       onclick="onLaunchClick(event)"
+       style="display:block;text-decoration:none;text-align:center">
       🔐 Iniciar sesión con Shark
-    </button>
+    </a>
     <p class="hint" style="text-align:center">Se abrirá la página oficial de Shark en una nueva pestaña.<br>
       <strong style="color:#FFD700">Si estás en el celular, hacé esto desde una PC.</strong></p>
 
@@ -1143,20 +1146,28 @@ function toggleEmail(){
 }
 
 // ── Cloud: web OAuth ────────────────────────────────────────────────────────
-function startWebOAuth(){
-  // Abrir /auth/launch directamente — el servidor genera el PKCE y redirige a Auth0
-  window.open('/auth/launch', '_blank');
-  document.getElementById('webBtn').disabled = true;
+function onLaunchClick(e){
+  // El <a href="/auth/launch" target="_blank"> navega nativamente — solo actualizar UI
+  document.getElementById('webBtn').style.pointerEvents = 'none';
+  document.getElementById('webBtn').style.opacity = '0.5';
   document.getElementById('sharkLoginLink').href = '/auth/launch';
   document.getElementById('step-launch').style.display = 'none';
   document.getElementById('step-paste').style.display = 'block';
   setStatus('', '');
 }
 
+function startWebOAuth(){
+  // fallback: llamar onLaunchClick y abrir manualmente
+  window.open('/auth/launch', '_blank');
+  onLaunchClick(null);
+}
+
 function resetOAuth(){
   document.getElementById('step-launch').style.display = 'block';
   document.getElementById('step-paste').style.display = 'none';
-  document.getElementById('webBtn').disabled = false;
+  const wb = document.getElementById('webBtn');
+  wb.style.pointerEvents = '';
+  wb.style.opacity = '';
   document.getElementById('redirectUrlInp').value = '';
   document.getElementById('continueBtn').disabled = true;
   setStatus('', '');
