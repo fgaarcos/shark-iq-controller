@@ -502,6 +502,20 @@ def auth_email():
                         await v.async_update()
                     except Exception:
                         pass
+
+                # Fallback: modelo nuevo → usar SkegoxApi con email+contraseña
+                if not vacuums:
+                    from sharkiq import SkegoxApi, SkegoxAuthManager, SkegoxDevice
+                    from sharkiq.const import REGION_ELSEWHERE
+                    skegox_auth = SkegoxAuthManager(email, pwd, region=REGION_ELSEWHERE)
+                    skegox_api  = SkegoxApi(skegox_auth)
+                    await skegox_api.discover()
+                    device_dicts = await skegox_api.get_all_devices()
+                    if device_dicts:
+                        vacuums = [_SkegoxWrapper(SkegoxDevice(skegox_api, d), skegox_api)
+                                   for d in device_dicts]
+                        api = skegox_api
+
                 return api, vacuums, sess
             except Exception:
                 await sess.close()
