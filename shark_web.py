@@ -480,18 +480,10 @@ def auth_status():
 def auth_launch():
     """Genera PKCE, guarda el verifier y redirige directo al login de Auth0."""
     verifier, challenge, state_val = _pkce_generate()
-    if CLOUD:
-        # Intentar usar nuestro propio servidor como callback (funciona si Auth0 lo acepta)
-        web_uri = request.url_root.rstrip('/') + '/auth/callback'
-        with _state_lock:
-            _state["pkce_verifier"]     = verifier
-            _state["pkce_redirect_uri"] = web_uri
-        auth_url = _build_auth_url(verifier, challenge, state_val, override_redirect=web_uri)
-    else:
-        with _state_lock:
-            _state["pkce_verifier"]     = verifier
-            _state["pkce_redirect_uri"] = AUTH0_REDIRECT_URI
-        auth_url = _build_auth_url(verifier, challenge, state_val)
+    with _state_lock:
+        _state["pkce_verifier"]     = verifier
+        _state["pkce_redirect_uri"] = AUTH0_REDIRECT_URI
+    auth_url = _build_auth_url(verifier, challenge, state_val)
     return redirect(auth_url, code=302)
 
 
@@ -1294,16 +1286,13 @@ LOGIN_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Paso 2: pegar URL de redirección -->
+  <!-- Paso 2: instrucciones Firefox -->
   <div id="step-paste" style="display:none">
-    <p style="font-size:13px;font-weight:700;color:#E8F3FF;margin-bottom:8px;text-align:left">
-      Si Auth0 te redirigió a nuestro servidor → <span style="color:#00C878">el login se completa solo</span>, cerrá esa pestaña.</p>
-    <p style="font-size:13px;font-weight:700;color:#E8F3FF;margin-top:12px;margin-bottom:8px;text-align:left">
-      Si la pestaña de Shark mostró un error o no pasó nada:</p>
+    <p style="font-size:13px;font-weight:700;color:#FFD700;margin-bottom:10px;text-align:center">⚠ Requiere Firefox</p>
     <ol class="steps">
-      <li>Abrí en <strong style="color:#FFD700">Firefox</strong>: <a href="/auth/launch-fallback" target="_blank" id="sharkLoginLink">Shark Login (Firefox) ↗</a></li>
+      <li>Abrí <a href="/auth/launch" target="_blank" rel="noopener" id="sharkLoginLink">este link en Firefox ↗</a></li>
       <li>Iniciá sesión con tu cuenta Shark</li>
-      <li>Firefox mostrará un error — copiá la <strong style="color:#E8F3FF">URL completa</strong> de la barra de direcciones</li>
+      <li>Firefox mostrará un error — <strong style="color:#E8F3FF">copiá la URL completa</strong> de la barra de direcciones<br><span style="font-size:11px;color:#3A5770">(empieza con com.sharkninja.shark://...)</span></li>
       <li>Pegala acá:</li>
     </ol>
     <textarea class="field" id="redirectUrlInp" rows="3"
