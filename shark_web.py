@@ -203,6 +203,9 @@ class _SkegoxWrapper:
     async def async_set_operating_mode(self, mode):
         await self._dev.async_set_operating_mode(mode)
 
+    async def async_clean_rooms(self, rooms):
+        await self._dev.async_clean_rooms(rooms)
+
 
 # ── Mapeo de modo a texto/color ───────────────────────────────────────────────
 MODE_MAP = {
@@ -1063,8 +1066,11 @@ def api_clean_rooms():
 
     vac = _state["vacuum"]
     try:
-        _run_async(vac.async_set_operating_mode(OperatingModes.START,
-                                                 room_names=to_clean))
+        if hasattr(vac, "async_clean_rooms"):
+            _run_async(vac.async_clean_rooms(to_clean))
+        else:
+            _run_async(vac.async_set_operating_mode(OperatingModes.START,
+                                                     room_names=to_clean))
         return jsonify({"ok": True, "cleaning": to_clean})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
