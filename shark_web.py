@@ -1080,20 +1080,18 @@ def api_clean_rooms():
     if not _state["authed"]:
         return jsonify({"ok": False, "msg": "No autenticado"})
     data = request.get_json() or {}
-    selected  = data.get("rooms", [])      # [robot_name, ...]
-    excluded  = set(data.get("excluded", []))  # carpet rooms to skip
-    to_clean  = [r for r in selected if r not in excluded]
-    if not to_clean:
+    selected  = data.get("rooms", [])
+    if not selected:
         return jsonify({"ok": False, "msg": "Ninguna habitación seleccionada"})
 
     vac = _state["vacuum"]
     try:
         if hasattr(vac, "async_clean_rooms"):
-            _run_async(vac.async_clean_rooms(to_clean))
+            _run_async(vac.async_clean_rooms(selected))
         else:
             _run_async(vac.async_set_operating_mode(OperatingModes.START,
-                                                     room_names=to_clean))
-        return jsonify({"ok": True, "cleaning": to_clean})
+                                                     room_names=selected))
+        return jsonify({"ok": True, "cleaning": selected})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
 
@@ -1815,24 +1813,22 @@ function renderRooms(){
   list.innerHTML = '';
   const wet = window._mopAttached;
   for(const [rn, dn] of Object.entries(S.rooms)){
-    const isCarpet  = S.carpet.has(rn);
-    const isExcluded = S.excluded.has(rn);
+    const isCarpet   = S.carpet.has(rn);
     const isSelected = S.selected.has(rn);
     const row = document.createElement('div');
-    row.className = 'room-row' + (isSelected?' selected':'') + (isExcluded?' excl':'');
+    row.className = 'room-row' + (isSelected?' selected':'');
 
-    // Badge de alfombra
     let badgeHtml = '';
     if(isCarpet){
       if(wet){
-        // Modo húmedo: siempre excluida, bloqueada
+        // Modo húmedo: bloqueada, no seleccionable
         badgeHtml = '<div class="carpet-badge excl-on">🚫 excl.</div>';
-      } else if(isExcluded){
-        // Modo seco, excluida manualmente
-        badgeHtml = '<div class="carpet-badge excl-on" data-toggle="'+rn+'">🟧 excluida ↺</div>';
+      } else if(isSelected){
+        // Modo seco, seleccionada (alfombra incluida) — badge para excluirla
+        badgeHtml = '<div class="carpet-badge" data-carpet="'+rn+'">🟧 incluida ×</div>';
       } else {
-        // Modo seco, incluida
-        badgeHtml = '<div class="carpet-badge" data-toggle="'+rn+'">🟧 incluida ↓excl</div>';
+        // Modo seco, no seleccionada
+        badgeHtml = '<div class="carpet-badge" style="opacity:0.5">🟧</div>';
       }
     }
 
@@ -1842,20 +1838,20 @@ function renderRooms(){
       ${badgeHtml}
     `;
 
-    // Click en la fila: seleccionar/deseleccionar habitación
+    // Click en la fila: seleccionar/deseleccionar (en modo húmedo bloquear alfombras)
     row.addEventListener('click', e=>{
-      if(e.target.dataset.toggle) return; // click en badge, no en fila
+      if(e.target.dataset.carpet) return;
+      if(wet && isCarpet) return;
       if(isSelected) S.selected.delete(rn);
       else S.selected.add(rn);
       renderRooms(); updateCleanBtn();
     });
 
-    // Click en badge (solo modo seco): toggle excluir alfombra
-    const badge = row.querySelector('[data-toggle]');
+    // Click en badge modo seco: excluir alfombra = deseleccionar room
+    const badge = row.querySelector('[data-carpet]');
     if(badge) badge.addEventListener('click', e=>{
       e.stopPropagation();
-      if(isExcluded) S.excluded.delete(rn);
-      else S.excluded.add(rn);
+      S.selected.delete(rn); // excluir = no limpiar este room
       renderRooms(); updateCleanBtn();
     });
 
@@ -1876,10 +1872,10 @@ function updateCleanBtn(){
 }
 
 async function cleanRooms(){
-  const rooms    = [...S.selected];
-  const excluded = [...S.excluded];
-  log('🧹 Limpiando '+rooms.filter(r=>!excluded.includes(r)).length+' habitaciones...');
-  const d = await api('/api/clean-rooms','POST',{rooms, excluded});
+  const rooms = [...S.selected];
+  if(!rooms.length){ log('⚠ Ninguna habitación seleccionada'); return; }
+  log('🧹 Limpiando '+rooms.length+' habitación'+(rooms.length>1?'es':'')+'...');
+  const d = await api('/api/clean-rooms','POST',{rooms});
   if(d.ok) log('✓ Limpieza iniciada');
   else log('⚠ '+d.msg);
 }
