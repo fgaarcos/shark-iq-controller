@@ -204,33 +204,21 @@ class _SkegoxWrapper:
     async def async_set_operating_mode(self, mode):
         await self._dev.async_set_operating_mode(mode)
 
-    def _get_floor_id(self):
-        """Obtiene floor_id del robot, fallback desde Robot_Room_List."""
-        dev = self._dev
-        floor_id = getattr(dev, '_floor_id', '') or ''
-        if not floor_id:
-            rl = dev.get_property_value('GET_Robot_Room_List') or ''
-            if ':' in str(rl):
-                floor_id = str(rl).split(':')[0]
-        return floor_id
-
     async def async_clean_rooms(self, rooms, clean_type='dry'):
         dev = self._dev
-        # Forzar V3 si el robot tiene la propiedad, independientemente de _has_areas_v3
+        # Respetar _has_areas_v3 de la librería — no forzar V3
         has_v3 = getattr(dev, '_has_areas_v3', False)
-        if not has_v3:
-            v3_val = dev.get_property_value('GET_AreasToClean_V3')
-            has_v3 = v3_val is not None  # la propiedad existe (aunque esté vacía)
         if has_v3 and hasattr(self._sapi, 'clean_rooms'):
-            floor_id = self._get_floor_id()
+            # V3: pasar clean_type para controlar inclusión de alfombras
             await self._sapi.clean_rooms(
                 snd=dev._snd,
                 rooms=rooms,
-                floor_id=floor_id,
+                floor_id=getattr(dev, '_floor_id', ''),
                 clean_type=clean_type,
                 use_v3=True,
             )
         else:
+            # V2 o Ayla: usar método original de la librería
             await dev.async_clean_rooms(rooms)
 
 
