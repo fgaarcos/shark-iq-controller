@@ -268,7 +268,12 @@ def _refresh_state():
             props = getattr(dev, "properties_full", {})
             val = props.get("GET_MopPlateAttached")
             if val is not None:
-                mop_attached = bool(int(str(val)))
+                if isinstance(val, bool):
+                    mop_attached = val
+                elif isinstance(val, int):
+                    mop_attached = bool(val)
+                else:
+                    mop_attached = str(val).lower() in ("true", "1", "yes")
         except Exception:
             pass
         with _state_lock:
