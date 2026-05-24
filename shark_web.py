@@ -61,9 +61,6 @@ _state = {
     "login_in_progress": False,
     "pkce_verifier": None,   # para OAuth web
     "pkce_redirect_uri": None,  # redirect URI usado en el último /auth/launch
-    "mop_attached": None,    # GET_MopPlateAttached
-    "water_ok": None,        # GET_WaterTankInstalled AND NOT GET_Water_Tank_Empty
-    "water_empty": None,     # GET_Water_Tank_Empty
 }
 _state_lock = threading.Lock()
 
@@ -107,31 +104,20 @@ def _build_auth_url(verifier, challenge, state_val, override_redirect=None):
     return AUTH0_URL + "/authorize?" + urllib.parse.urlencode(params)
 
 
-# ── Tokens persistentes ─────────────────────────────────────────────────────
+# ── Tokens persistentes ───────────────────────────────────────────────────────
 def _save_tokens(data: dict):
-    try:
-        with open(TOKEN_FILE, "w") as f:
-            json.dump(data, f)
-    except Exception:
-        pass  # en Railway el filesystem puede ser read-only
+    with open(TOKEN_FILE, "w") as f:
+        json.dump(data, f)
 
 
 def _load_tokens() -> dict | None:
-    # 1) archivo local
-    if os.path.exists(TOKEN_FILE):
-        try:
-            with open(TOKEN_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    # 2) variable de entorno SHARK_TOKENS (persiste en Railway aunque se reinicie)
-    env_tokens = os.environ.get("SHARK_TOKENS", "").strip()
-    if env_tokens:
-        try:
-            return json.loads(env_tokens)
-        except Exception:
-            pass
-    return None
+    if not os.path.exists(TOKEN_FILE):
+        return None
+    try:
+        with open(TOKEN_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 # ── Inicializar sesión desde tokens guardados ─────────────────────────────────
@@ -217,14 +203,8 @@ class _SkegoxWrapper:
     async def async_set_operating_mode(self, mode):
         await self._dev.async_set_operating_mode(mode)
 
-    async def async_clean_rooms(self, rooms, clean_type="dry"):
-        await self._dev._api.clean_rooms(
-            snd=self._dev._snd,
-            rooms=rooms,
-            floor_id=self._dev._floor_id,
-            use_v3=self._dev._has_areas_v3,
-            clean_type=clean_type,
-        )
+    async def async_clean_rooms(self, rooms):
+        await self._dev.async_clean_rooms(rooms)
 
 
 # ── Mapeo de modo a texto/color ───────────────────────────────────────────────
@@ -281,23 +261,11 @@ def _refresh_state():
         _run_async(vac.async_update())
         mode_key, mode_text, mode_color, battery = _resolve_mode(vac)
         with _state_lock:
-            _state["mode"]       = mode_key
+            _state["mode"]    = mode_key
             _state["mode_text"]  = mode_text
             _state["mode_color"] = mode_color
-            _state["battery"]    = battery
-    except Exception:
-        pass
-    try:
-        mop      = vac.get_property_value("GET_MopPlateAttached")
-        t_inst   = vac.get_property_value("GET_WaterTankInstalled")
-        t_empty  = vac.get_property_value("GET_Water_Tank_Empty")
-        with _state_lock:
-            if mop is not None:
-                _state["mop_attached"] = bool(mop)
-            if t_inst is not None:
-                _state["water_empty"] = bool(t_empty)
-                _state["water_ok"]    = bool(t_inst) and not bool(t_empty)
-    except Exception:
+            _state["battery"] = battery
+    except Exception as e:
         pass
 
 
@@ -853,15 +821,6 @@ def auth_browser_code():
     return jsonify({"ok": True})
 
 
-@app.route("/auth/tokens-export")
-def auth_tokens_export():
-    """Devuelve el JSON de tokens actual para guardarlo como SHARK_TOKENS en Railway."""
-    tokens = _load_tokens()
-    if not tokens:
-        return jsonify({"ok": False, "msg": "No hay tokens guardados"}), 404
-    return jsonify({"ok": True, "tokens": json.dumps(tokens)})
-
-
 @app.route("/auth/restore-tokens", methods=["POST"])
 def auth_restore_tokens():
     """Acepta el JSON del shark_web_tokens.json local y restaura la sesión."""
@@ -1099,21 +1058,20 @@ def api_clean_rooms():
     if not _state["authed"]:
         return jsonify({"ok": False, "msg": "No autenticado"})
     data = request.get_json() or {}
-    selected   = data.get("rooms", [])          # [robot_name, ...]
-    excluded   = set(data.get("excluded", []))  # carpet rooms to skip
-    clean_type = data.get("clean_type", "dry")  # "dry" | "wet"
-    to_clean   = [r for r in selected if r not in excluded]
+    selected  = data.get("rooms", [])      # [robot_name, ...]
+    excluded  = set(data.get("excluded", []))  # carpet rooms to skip
+    to_clean  = [r for r in selected if r not in excluded]
     if not to_clean:
         return jsonify({"ok": False, "msg": "Ninguna habitación seleccionada"})
 
     vac = _state["vacuum"]
     try:
         if hasattr(vac, "async_clean_rooms"):
-            _run_async(vac.async_clean_rooms(to_clean, clean_type=clean_type))
+            _run_async(vac.async_clean_rooms(to_clean))
         else:
             _run_async(vac.async_set_operating_mode(OperatingModes.START,
                                                      room_names=to_clean))
-        return jsonify({"ok": True, "cleaning": to_clean, "clean_type": clean_type})
+        return jsonify({"ok": True, "cleaning": to_clean})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
 
@@ -1357,10 +1315,14 @@ LOGIN_HTML = """<!DOCTYPE html>
 {% if is_cloud %}
   <!-- ── MODO CLOUD: OAuth web ── -->
   <div id="step-launch">
-    <button class="btn btn-primary" id="webBtn" onclick="onLaunchClick()">
+    <a href="/auth/launch" target="_blank" rel="noopener"
+       class="btn btn-primary" id="webBtn"
+       onclick="onLaunchClick(event)"
+       style="display:block;text-decoration:none;text-align:center">
       🔐 Iniciar sesión con Shark
-    </button>
-    <p class="hint" style="text-align:center">Funciona desde el celular y la PC.</p>
+    </a>
+    <p class="hint" style="text-align:center">Se abrirá la página oficial de Shark en una nueva pestaña.<br>
+      <strong style="color:#FFD700">Si estás en el celular, hacé esto desde una PC.</strong></p>
 
     <div class="divider">o</div>
     <button class="btn-ghost" onclick="toggleEmail()">📧 Intentar con email</button>
@@ -1445,16 +1407,28 @@ async function submitTokens(){
 }
 
 // ── Cloud: web OAuth ────────────────────────────────────────────────────────
-function onLaunchClick(){
-  // Solo mostrar step-paste con instrucciones — el usuario toca el link manualmente
+function onLaunchClick(e){
+  // El <a href="/auth/launch" target="_blank"> navega nativamente — solo actualizar UI
+  document.getElementById('webBtn').style.pointerEvents = 'none';
+  document.getElementById('webBtn').style.opacity = '0.5';
+  document.getElementById('sharkLoginLink').href = '/auth/launch';
   document.getElementById('step-launch').style.display = 'none';
   document.getElementById('step-paste').style.display = 'block';
   setStatus('', '');
 }
 
+function startWebOAuth(){
+  // fallback: llamar onLaunchClick y abrir manualmente
+  window.open('/auth/launch', '_blank');
+  onLaunchClick(null);
+}
+
 function resetOAuth(){
   document.getElementById('step-launch').style.display = 'block';
   document.getElementById('step-paste').style.display = 'none';
+  const wb = document.getElementById('webBtn');
+  wb.style.pointerEvents = '';
+  wb.style.opacity = '';
   document.getElementById('redirectUrlInp').value = '';
   document.getElementById('continueBtn').disabled = true;
   setStatus('', '');
@@ -1617,15 +1591,6 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
            margin-top:12px;cursor:pointer;transition:.15s}
 .btn-clean:active{background:#00C878}
 .btn-clean:disabled{background:#141E2C;color:#5E7E9A;cursor:not-allowed}
-/* Toggle switch */
-.tog-wrap{position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0}
-.tog-wrap input{opacity:0;width:0;height:0}
-.tog-sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;
-        background:#1B2C40;border-radius:24px;transition:.2s}
-.tog-sl:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;
-               background:#5E7E9A;border-radius:50%;transition:.2s}
-input:checked+.tog-sl{background:#2896FF}
-input:checked+.tog-sl:before{transform:translateX(20px);background:#fff}
 /* Spinner */
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid #1B2C40;
          border-top-color:#2896FF;border-radius:50%;animation:spin .7s linear infinite;
@@ -1654,10 +1619,6 @@ input:checked+.tog-sl:before{transform:translateX(20px);background:#fff}
     <div class="robot-info">
       <div class="robot-name" id="robotName">{{ robot_name }}</div>
       <div class="robot-mode" id="robotMode" style="color:#5E7E9A">● Actualizando...</div>
-      <div id="mopRow" style="display:none;margin-top:5px;display:flex;gap:6px;flex-wrap:wrap">
-        <span id="mopStatus" style="font-size:11px;padding:2px 8px;border-radius:6px;background:#0C1520;border:1px solid #1B2C40">&#129533;</span>
-        <span id="waterStatus" style="font-size:11px;padding:2px 8px;border-radius:6px;background:#0C1520;border:1px solid #1B2C40">💧</span>
-      </div>
     </div>
     <div class="battery-col">
       <div class="batt-pct" id="battPct">--%</div>
@@ -1702,14 +1663,8 @@ input:checked+.tog-sl:before{transform:translateX(20px);background:#fff}
       <span style="font-size:11px;color:#5E7E9A">🟫 = alfombra — toca para excluir</span>
     </div>
     <div class="room-list" id="roomList"></div>
-    <div id="mopCleanRow" style="margin-top:10px;padding:10px 14px;background:#141E2C;
-         border-radius:10px;border:1px solid #1B2C40;font-size:12px;color:#5E7E9A"
-         id="mopCleanRow">
-      Tipo de limpieza: <strong id="cleanTypeLabel" style="color:#E8F3FF">seco</strong>
-      <span id="cleanTypeHint" style="margin-left:6px;font-size:11px"></span>
-    </div>
     <button class="btn-clean" id="cleanBtn" disabled onclick="cleanRooms()">
-      &#129529; Limpiar seleccionadas
+      🧹 Limpiar seleccionadas
     </button>
   </div>
 </div>
@@ -1737,7 +1692,7 @@ async function doRefresh(){
 }
 
 function updateStatus(d){
-  document.getElementById('robotMode').textContent = d.mode_text || '\u25cf';
+  document.getElementById('robotMode').textContent = d.mode_text || '●';
   document.getElementById('robotMode').style.color = d.mode_color || '#5E7E9A';
   if(d.battery != null){
     document.getElementById('battPct').textContent = d.battery+'%';
@@ -1747,41 +1702,8 @@ function updateStatus(d){
     document.getElementById('battBar').style.background = color;
     document.getElementById('battPct').style.color = color;
   }
-  // Mop / water status
-  if(d.mop_attached !== null && d.mop_attached !== undefined){
-    const mopEl = document.getElementById('mopStatus');
-    mopEl.textContent = d.mop_attached ? '\ud83e\uddfd Almohadilla colocada' : '\ud83e\uddfd Sin almohadilla';
-    mopEl.style.color = d.mop_attached ? '#00C878' : '#5E7E9A';
-    document.getElementById('mopRow').style.display = 'flex';
-  }
-  if(d.water_ok !== null && d.water_ok !== undefined){
-    const wEl = document.getElementById('waterStatus');
-    if(d.water_ok){
-      wEl.textContent = '\ud83d\udca7 Tanque con agua';
-      wEl.style.color = '#58a6ff';
-    } else {
-      wEl.textContent = '\u26a0\ufe0f Tanque vac\u00edo';
-      wEl.style.color = '#FF4040';
-    }
-  }
   document.getElementById('connDot').style.color = '#00C878';
   document.getElementById('connLbl').textContent = d.name||'Conectado';
-  // cache para limpieza por habitación
-  window._detectedMop = !!(d.mop_attached && d.water_ok);
-  // Actualizar label tipo de limpieza en panel Mapa
-  const lbl = document.getElementById('cleanTypeLabel');
-  const hint = document.getElementById('cleanTypeHint');
-  if(lbl){
-    if(window._detectedMop){
-      lbl.textContent = 'húmedo (🧽 almohadilla colocada)';
-      lbl.style.color = '#58a6ff';
-      if(hint) hint.textContent = '';
-    } else {
-      lbl.textContent = 'seco';
-      lbl.style.color = '#E8F3FF';
-      if(hint) hint.textContent = d.mop_attached ? '⚠️ Tanque vacío' : '';
-    }
-  }
 }
 
 // Auto-refresh every 30 s
@@ -1863,22 +1785,12 @@ function updateCleanBtn(){
 }
 
 async function cleanRooms(){
-  const rooms     = [...S.selected];
-  const excluded  = [...S.excluded];
-  const hasMop    = !!(window._detectedMop);
-  const cleanType = hasMop ? 'wet' : 'dry';
-  const count     = rooms.filter(r=>!excluded.includes(r)).length;
-  const icon      = hasMop ? '🧽' : '🧹';
-  setMapStatus('<span class="spinner"></span> Iniciando limpieza...');
-  log(icon+' Limpiando '+count+' hab. ('+cleanType+')');
-  const d = await api('/api/clean-rooms','POST',{rooms, excluded, clean_type: cleanType});
-  if(d.ok){
-    setMapStatus(icon+' Limpieza iniciada \u2014 '+count+' habitaci'+(count===1?'\u00f3n':'ones')+' ('+cleanType+')');
-    log('\u2713 Limpieza iniciada');
-  } else {
-    setMapStatus('\u26a0 '+d.msg);
-    log('\u26a0 '+d.msg);
-  }
+  const rooms    = [...S.selected];
+  const excluded = [...S.excluded];
+  log('🧹 Limpiando '+rooms.filter(r=>!excluded.includes(r)).length+' habitaciones...');
+  const d = await api('/api/clean-rooms','POST',{rooms, excluded});
+  if(d.ok) log('✓ Limpieza iniciada');
+  else log('⚠ '+d.msg);
 }
 
 function setMapStatus(html){
