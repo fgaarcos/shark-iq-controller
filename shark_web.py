@@ -61,6 +61,9 @@ _state = {
     "login_in_progress": False,
     "pkce_verifier": None,   # para OAuth web
     "pkce_redirect_uri": None,  # redirect URI usado en el último /auth/launch
+    "mop_attached": None,    # GET_MopPlateAttached
+    "water_ok": None,        # GET_WaterTankInstalled AND NOT GET_Water_Tank_Empty
+    "water_empty": None,     # GET_Water_Tank_Empty
 }
 _state_lock = threading.Lock()
 
@@ -278,11 +281,23 @@ def _refresh_state():
         _run_async(vac.async_update())
         mode_key, mode_text, mode_color, battery = _resolve_mode(vac)
         with _state_lock:
-            _state["mode"]    = mode_key
+            _state["mode"]       = mode_key
             _state["mode_text"]  = mode_text
             _state["mode_color"] = mode_color
-            _state["battery"] = battery
-    except Exception as e:
+            _state["battery"]    = battery
+    except Exception:
+        pass
+    try:
+        mop      = vac.get_property_value("GET_MopPlateAttached")
+        t_inst   = vac.get_property_value("GET_WaterTankInstalled")
+        t_empty  = vac.get_property_value("GET_Water_Tank_Empty")
+        with _state_lock:
+            if mop is not None:
+                _state["mop_attached"] = bool(mop)
+            if t_inst is not None:
+                _state["water_empty"] = bool(t_empty)
+                _state["water_ok"]    = bool(t_inst) and not bool(t_empty)
+    except Exception:
         pass
 
 
@@ -1655,6 +1670,10 @@ input:checked+.tog-sl:before{transform:translateX(20px);background:#fff}
     <div class="robot-info">
       <div class="robot-name" id="robotName">{{ robot_name }}</div>
       <div class="robot-mode" id="robotMode" style="color:#5E7E9A">● Actualizando...</div>
+      <div id="mopRow" style="display:none;margin-top:5px;display:flex;gap:6px;flex-wrap:wrap">
+        <span id="mopStatus" style="font-size:11px;padding:2px 8px;border-radius:6px;background:#0C1520;border:1px solid #1B2C40">&#129533;</span>
+        <span id="waterStatus" style="font-size:11px;padding:2px 8px;border-radius:6px;background:#0C1520;border:1px solid #1B2C40">💧</span>
+      </div>
     </div>
     <div class="battery-col">
       <div class="batt-pct" id="battPct">--%</div>
@@ -1699,17 +1718,14 @@ input:checked+.tog-sl:before{transform:translateX(20px);background:#fff}
       <span style="font-size:11px;color:#5E7E9A">🟫 = alfombra — toca para excluir</span>
     </div>
     <div class="room-list" id="roomList"></div>
-    <div style="display:flex;align-items:center;gap:12px;margin-top:12px;padding:12px 14px;
-                background:#141E2C;border-radius:10px;border:1px solid #1B2C40">
-      <span style="font-size:20px">🧽</span>
-      <span style="flex:1;font-size:14px;font-weight:600;color:#E8F3FF">Almohadilla colocada</span>
-      <label class="tog-wrap">
-        <input type="checkbox" id="mopToggle">
-        <span class="tog-sl"></span>
-      </label>
+    <div id="mopCleanRow" style="margin-top:10px;padding:10px 14px;background:#141E2C;
+         border-radius:10px;border:1px solid #1B2C40;font-size:12px;color:#5E7E9A"
+         id="mopCleanRow">
+      Tipo de limpieza: <strong id="cleanTypeLabel" style="color:#E8F3FF">seco</strong>
+      <span id="cleanTypeHint" style="margin-left:6px;font-size:11px"></span>
     </div>
     <button class="btn-clean" id="cleanBtn" disabled onclick="cleanRooms()">
-      🧹 Limpiar seleccionadas
+      &#129529; Limpiar seleccionadas
     </button>
   </div>
 </div>
@@ -1737,7 +1753,7 @@ async function doRefresh(){
 }
 
 function updateStatus(d){
-  document.getElementById('robotMode').textContent = d.mode_text || '●';
+  document.getElementById('robotMode').textContent = d.mode_text || '\u25cf';
   document.getElementById('robotMode').style.color = d.mode_color || '#5E7E9A';
   if(d.battery != null){
     document.getElementById('battPct').textContent = d.battery+'%';
@@ -1747,8 +1763,41 @@ function updateStatus(d){
     document.getElementById('battBar').style.background = color;
     document.getElementById('battPct').style.color = color;
   }
+  // Mop / water status
+  if(d.mop_attached !== null && d.mop_attached !== undefined){
+    const mopEl = document.getElementById('mopStatus');
+    mopEl.textContent = d.mop_attached ? '\ud83e\uddfd Almohadilla colocada' : '\ud83e\uddfd Sin almohadilla';
+    mopEl.style.color = d.mop_attached ? '#00C878' : '#5E7E9A';
+    document.getElementById('mopRow').style.display = 'flex';
+  }
+  if(d.water_ok !== null && d.water_ok !== undefined){
+    const wEl = document.getElementById('waterStatus');
+    if(d.water_ok){
+      wEl.textContent = '\ud83d\udca7 Tanque con agua';
+      wEl.style.color = '#58a6ff';
+    } else {
+      wEl.textContent = '\u26a0\ufe0f Tanque vac\u00edo';
+      wEl.style.color = '#FF4040';
+    }
+  }
   document.getElementById('connDot').style.color = '#00C878';
   document.getElementById('connLbl').textContent = d.name||'Conectado';
+  // cache para limpieza por habitación
+  window._detectedMop = !!(d.mop_attached && d.water_ok);
+  // Actualizar label tipo de limpieza en panel Mapa
+  const lbl = document.getElementById('cleanTypeLabel');
+  const hint = document.getElementById('cleanTypeHint');
+  if(lbl){
+    if(window._detectedMop){
+      lbl.textContent = 'húmedo (🧽 almohadilla colocada)';
+      lbl.style.color = '#58a6ff';
+      if(hint) hint.textContent = '';
+    } else {
+      lbl.textContent = 'seco';
+      lbl.style.color = '#E8F3FF';
+      if(hint) hint.textContent = d.mop_attached ? '⚠️ Tanque vacío' : '';
+    }
+  }
 }
 
 // Auto-refresh every 30 s
@@ -1832,15 +1881,15 @@ function updateCleanBtn(){
 async function cleanRooms(){
   const rooms     = [...S.selected];
   const excluded  = [...S.excluded];
-  const hasMop    = document.getElementById('mopToggle').checked;
+  const hasMop    = !!(window._detectedMop);
   const cleanType = hasMop ? 'wet' : 'dry';
   const count     = rooms.filter(r=>!excluded.includes(r)).length;
-  const icon      = hasMop ? '🧽' : '🧹';
+  const icon      = hasMop ? '\ud83e\uddfd' : '\ud83e\uddf9';
   setMapStatus('<span class="spinner"></span> Iniciando limpieza...');
   log(icon+' Limpiando '+count+' hab. ('+cleanType+')');
   const d = await api('/api/clean-rooms','POST',{rooms, excluded, clean_type: cleanType});
   if(d.ok){
-    setMapStatus(icon+' Limpieza iniciada &mdash; '+count+' habitaci'+(count===1?'ón':'ones')+' ('+cleanType+')');
+    setMapStatus(icon+' Limpieza iniciada \u2014 '+count+' habitaci'+(count===1?'\u00f3n':'ones')+' ('+cleanType+')');
     log('\u2713 Limpieza iniciada');
   } else {
     setMapStatus('\u26a0 '+d.msg);
