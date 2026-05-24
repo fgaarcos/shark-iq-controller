@@ -1913,7 +1913,7 @@ function renderRooms(){
 
     row.innerHTML = `
       <div class="room-check">${isSelected?'✓':''}</div>
-      <div class="room-name">${dn}${rn!==dn?'<small style="opacity:.5;font-size:.75em;display:block">id:'+rn+'</small>':''}</div>
+      <div class="room-name">${dn}</div>
       ${badgeHtml}
     `;
 
