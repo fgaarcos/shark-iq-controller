@@ -1141,6 +1141,24 @@ def api_clean_rooms():
         return jsonify({"ok": False, "msg": str(e)})
 
 
+@app.route("/api/find-device", methods=["POST"])
+def api_find_device():
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"})
+    vac = _state["vacuum"]
+    if vac is None:
+        return jsonify({"ok": False, "msg": "Sin robot"})
+    try:
+        dev = getattr(vac, "_dev", vac)
+        if hasattr(dev, "async_find_device"):
+            _run_async(dev.async_find_device())
+        else:
+            _run_async(dev.async_set_property_value("Find_Device", 1))
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
 # ── Descarga de mapa (async) ──────────────────────────────────────────────────
 async def _fetch_map(vac, api):
     import aiohttp as _aiohttp
@@ -1709,6 +1727,7 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
   </div>
   <div class="btn-sm-grid">
     <button class="btn-sm" onclick="doRefresh()">🔄 Actualizar</button>
+    <button class="btn-sm" onclick="findDevice()">📍 Localizar robot</button>
     <button class="btn-sm btn-danger" onclick="doLogout()">🚪 Cerrar sesión</button>
   </div>
   <div class="log-area" id="logArea"></div>
@@ -1828,6 +1847,13 @@ async function sendCmd(cmd){
   log('⏳ '+labels[cmd]);
   const d = await api('/api/command/'+cmd,'POST');
   if(d.ok){ updateStatus(d); log('✓ '+d.mode_text); }
+  else log('⚠ '+d.msg);
+}
+
+async function findDevice(){
+  log('📍 Buscando robot...');
+  const d = await api('/api/find-device','POST');
+  if(d.ok) log('✓ El robot debería emitir un sonido');
   else log('⚠ '+d.msg);
 }
 
