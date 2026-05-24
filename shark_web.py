@@ -61,6 +61,7 @@ _state = {
     "login_in_progress": False,
     "pkce_verifier": None,   # para OAuth web
     "pkce_redirect_uri": None,  # redirect URI usado en el último /auth/launch
+    "mop_attached": None,    # GET_MopPlateAttached
 }
 _state_lock = threading.Lock()
 
@@ -260,11 +261,22 @@ def _refresh_state():
     try:
         _run_async(vac.async_update())
         mode_key, mode_text, mode_color, battery = _resolve_mode(vac)
+        # Leer estado de la almohadilla
+        mop_attached = None
+        try:
+            dev = getattr(vac, "_dev", vac)
+            props = getattr(dev, "properties_full", {})
+            val = props.get("GET_MopPlateAttached")
+            if val is not None:
+                mop_attached = bool(int(str(val)))
+        except Exception:
+            pass
         with _state_lock:
-            _state["mode"]    = mode_key
-            _state["mode_text"]  = mode_text
-            _state["mode_color"] = mode_color
-            _state["battery"] = battery
+            _state["mode"]        = mode_key
+            _state["mode_text"]   = mode_text
+            _state["mode_color"]  = mode_color
+            _state["battery"]     = battery
+            _state["mop_attached"] = mop_attached
     except Exception as e:
         pass
 
@@ -965,12 +977,13 @@ def api_status():
     if vac is None:
         return jsonify({"ok": False, "msg": "No conectado"})
     return jsonify({
-        "ok":         True,
-        "mode":       _state.get("mode", "UNKNOWN"),
-        "mode_text":  _state.get("mode_text", "● Desconocido"),
-        "mode_color": _state.get("mode_color", "#8b949e"),
-        "battery":    _state.get("battery"),
-        "name":       vac.name,
+        "ok":          True,
+        "mode":        _state.get("mode", "UNKNOWN"),
+        "mode_text":   _state.get("mode_text", "● Desconocido"),
+        "mode_color":  _state.get("mode_color", "#8b949e"),
+        "battery":     _state.get("battery"),
+        "name":        vac.name,
+        "mop_attached": _state.get("mop_attached"),
     })
 
 
@@ -1619,6 +1632,8 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
     <div class="robot-info">
       <div class="robot-name" id="robotName">{{ robot_name }}</div>
       <div class="robot-mode" id="robotMode" style="color:#5E7E9A">● Actualizando...</div>
+      <div id="mopBadge" style="display:none;margin-top:4px;font-size:11px;padding:2px 8px;
+           border-radius:6px;background:#0C1520;border:1px solid #1B2C40;width:fit-content"></div>
     </div>
     <div class="battery-col">
       <div class="batt-pct" id="battPct">--%</div>
@@ -1704,6 +1719,20 @@ function updateStatus(d){
   }
   document.getElementById('connDot').style.color = '#00C878';
   document.getElementById('connLbl').textContent = d.name||'Conectado';
+  // Indicador almohadilla
+  if(d.mop_attached !== null && d.mop_attached !== undefined){
+    const badge = document.getElementById('mopBadge');
+    if(d.mop_attached){
+      badge.textContent = '🧽 Almohadilla colocada';
+      badge.style.color = '#00C878';
+      badge.style.borderColor = '#005533';
+    } else {
+      badge.textContent = '🧹 Sin almohadilla (modo seco)';
+      badge.style.color = '#5E7E9A';
+      badge.style.borderColor = '#1B2C40';
+    }
+    badge.style.display = 'block';
+  }
 }
 
 // Auto-refresh every 30 s
