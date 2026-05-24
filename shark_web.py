@@ -1864,11 +1864,14 @@ function renderRooms(){
 }
 
 function updateCleanBtn(){
-  const active = [...S.selected].filter(r=>!S.excluded.has(r));
+  // El botón se habilita con cualquier habitación seleccionada.
+  // S.excluded son zonas de alfombra a evitar DENTRO de la habitación,
+  // no habitaciones completas excluidas.
+  const count = S.selected.size;
   const btn = document.getElementById('cleanBtn');
-  btn.disabled = active.length === 0;
-  btn.textContent = active.length
-    ? `🧹 Limpiar ${active.length} habitación${active.length>1?'es':''}`
+  btn.disabled = count === 0;
+  btn.textContent = count
+    ? `🧹 Limpiar ${count} habitación${count>1?'es':''}`
     : '🧹 Limpiar seleccionadas';
 }
 
