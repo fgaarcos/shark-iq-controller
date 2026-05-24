@@ -1796,9 +1796,9 @@ function updateStatus(d){
   if(prevMop !== window._mopAttached) applyMopMode();
 }
 
-// Auto-refresh every 30 s
+// Auto-refresh every 30 s — llama /api/refresh para actualizar estado del robot
 setInterval(()=>{
-  api('/api/status').then(d=>{ if(d.ok) updateStatus(d); });
+  api('/api/refresh','POST').then(d=>{ if(d.ok) updateStatus(d); });
 }, 30000);
 
 // Initial load
