@@ -818,6 +818,48 @@ def auth_browser_code():
     return jsonify({"ok": True})
 
 
+@app.route("/auth/restore-tokens", methods=["POST"])
+def auth_restore_tokens():
+    """Acepta el JSON del shark_web_tokens.json local y restaura la sesión."""
+    if _state["login_in_progress"]:
+        return jsonify({"ok": False, "msg": "Login ya en progreso"})
+    data = request.get_json(force=True) or {}
+    token_str = (data.get("tokens") or "").strip()
+    try:
+        tokens = json.loads(token_str)
+    except Exception:
+        return jsonify({"ok": False, "msg": "JSON inválido — copiá el archivo completo"})
+    for k in ("auth0_id_token", "ayla_access_token"):
+        if k not in tokens:
+            return jsonify({"ok": False, "msg": f"Falta campo: {k}"})
+    with _state_lock:
+        _state["login_in_progress"] = True
+        _state["login_status"] = "\u23f3 Restaurando sesión..."
+    def _do_restore():
+        try:
+            api, vacuums, sess = _run_async(_init_from_tokens(tokens))
+            if vacuums:
+                _save_tokens(tokens)
+            with _state_lock:
+                _state["api"]        = api
+                _state["vacuums"]    = vacuums
+                _state["vacuum"]     = vacuums[0] if vacuums else None
+                _state["authed"]     = bool(vacuums)
+                _state["login_in_progress"] = False
+                _state["login_status"] = (
+                    f"\u2713 Sesión restaurada \u2014 {vacuums[0].name}" if vacuums
+                    else "\u274c No se encontraron robots."
+                )
+            if vacuums:
+                _refresh_state()
+        except Exception as exc:
+            with _state_lock:
+                _state["login_status"] = f"\u274c Error: {str(exc)[:120]}"
+                _state["login_in_progress"] = False
+    threading.Thread(target=_do_restore, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 @app.route("/auth/email", methods=["POST"])
 def auth_email():
     """Login con email + contraseña (alternativa al navegador)."""
@@ -1284,15 +1326,25 @@ LOGIN_HTML = """<!DOCTYPE html>
       <input class="field" type="password" id="passInp" placeholder="Contraseña" autocomplete="current-password">
       <button class="btn btn-primary" id="emailBtn" onclick="startEmail()">Conectar</button>
     </div>
+
+    <div class="divider">o</div>
+    <button class="btn-ghost" onclick="toggleTokens()">📋 Restaurar sesión desde tokens</button>
+    <div id="tokenForm" style="display:none;margin-top:10px;text-align:left">
+      <p style="font-size:11px;color:#5E7E9A;margin-bottom:6px">Pegá el contenido del archivo <code style="color:#AAD4FF;font-size:10px">shark_web_tokens.json</code> de tu PC local:</p>
+      <textarea class="field" id="tokenJsonInp" rows="4"
+        placeholder='{"auth0_id_token":"...", "ayla_access_token":"..."}'
+        oninput="document.getElementById('restoreBtn').disabled=!this.value.trim()"></textarea>
+      <button class="btn btn-primary" id="restoreBtn" onclick="submitTokens()" disabled>Restaurar sesión</button>
+    </div>
   </div>
 
-  <!-- Paso 2: instrucciones Firefox -->
+  <!-- Paso 2: pegar URL -->
   <div id="step-paste" style="display:none">
-    <p style="font-size:13px;font-weight:700;color:#FFD700;margin-bottom:10px;text-align:center">⚠ Requiere Firefox</p>
+    <p style="font-size:13px;font-weight:700;color:#E8F3FF;margin-bottom:10px;text-align:center">Login desde PC (Chrome o Firefox)</p>
     <ol class="steps">
-      <li>Abrí <a href="/auth/launch" target="_blank" rel="noopener" id="sharkLoginLink">este link en Firefox ↗</a></li>
+      <li>Abrí <a href="/auth/launch" target="_blank" rel="noopener" id="sharkLoginLink">este link en tu PC ↗</a><br><span style="font-size:11px;color:#3A5770">en Chrome o Firefox — en la PC, no en el celular</span></li>
       <li>Iniciá sesión con tu cuenta Shark</li>
-      <li>Firefox mostrará un error — <strong style="color:#E8F3FF">copiá la URL completa</strong> de la barra de direcciones<br><span style="font-size:11px;color:#3A5770">(empieza con com.sharkninja.shark://...)</span></li>
+      <li>El navegador mostrará un error “no se puede abrir” &mdash; <strong style="color:#E8F3FF">copiá la URL completa</strong> de la barra de direcciones<br><span style="font-size:11px;color:#3A5770">(empieza con com.sharkninja.shark://...)</span></li>
       <li>Pegala acá:</li>
     </ol>
     <textarea class="field" id="redirectUrlInp" rows="3"
@@ -1331,6 +1383,21 @@ let emailVisible = false;
 function toggleEmail(){
   emailVisible = !emailVisible;
   document.getElementById('emailForm').style.display = emailVisible ? 'block' : 'none';
+}
+
+let tokenVisible = false;
+function toggleTokens(){
+  tokenVisible = !tokenVisible;
+  document.getElementById('tokenForm').style.display = tokenVisible ? 'block' : 'none';
+}
+async function submitTokens(){
+  const tokenJson = document.getElementById('tokenJsonInp').value.trim();
+  document.getElementById('restoreBtn').disabled = true;
+  setStatus('<span class="spinner"></span> Restaurando sesión...', '');
+  polling = true;
+  const d = await apiFetch('/auth/restore-tokens','POST',{tokens:tokenJson});
+  if(!d.ok){ setStatus('\u274c '+d.msg,'err'); document.getElementById('restoreBtn').disabled=false; polling=false; return; }
+  poll();
 }
 
 // ── Cloud: web OAuth ────────────────────────────────────────────────────────
