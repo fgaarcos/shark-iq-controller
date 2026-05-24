@@ -993,7 +993,7 @@ def api_command(cmd):
     CMD_MAP = {
         "start": OperatingModes.START,
         "pause": OperatingModes.PAUSE,
-        "dock":  OperatingModes.STOP,
+        "dock":  OperatingModes.RETURN,
     }
     mode = CMD_MAP.get(cmd)
     if mode is None:
