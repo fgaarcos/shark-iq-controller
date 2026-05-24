@@ -1765,13 +1765,13 @@ function applyMopMode(){
   // Hint y nota
   const hint = document.getElementById('carpetHint');
   const note = document.getElementById('wetModeNote');
-  if(hint) hint.textContent = wet ? '' : '🟧 = alfombra — toca para excluir';
+  if(hint) hint.textContent = wet ? '' : '🟧 = alfombra';
   if(note) note.style.display = wet ? 'block' : 'none';
-  // Auto-excluir alfombras en modo húmedo
   if(wet){
-    S.carpet.forEach(rn => S.excluded.add(rn));
+    // Modo húmedo: excluir alfombras y deseleccionarlas
+    S.carpet.forEach(rn => { S.excluded.add(rn); S.selected.delete(rn); });
   } else {
-    // En modo seco, quitar la auto-exclusión (sólo las que se excluyeron automáticamente)
+    // Modo seco: alfombras disponibles como cualquier habitación
     S.carpet.forEach(rn => S.excluded.delete(rn));
   }
   if(Object.keys(S.rooms).length > 0) renderRooms();
@@ -1813,30 +1813,37 @@ async function loadMap(){
 function renderRooms(){
   const list = document.getElementById('roomList');
   list.innerHTML = '';
+  const wet = window._mopAttached;
   for(const [rn, dn] of Object.entries(S.rooms)){
+    const isCarpet = S.carpet.has(rn);
+    const isExcluded = S.excluded.has(rn);
+    const isSelected = S.selected.has(rn);
     const row = document.createElement('div');
-    row.className = 'room-row' + (S.selected.has(rn)?' selected':'') + (S.excluded.has(rn)?' excl':'');
-    row.innerHTML = `
-      <div class="room-check">${S.selected.has(rn)?'✓':''}</div>
-      <div class="room-name">${dn}</div>
-      ${S.carpet.has(rn)?'<div class="carpet-badge'+(S.excluded.has(rn)?' excl-on':'')+'" data-rn="'+rn+'">🟫 excl.</div>':''}
-    `;
-    // Toggle selección
-    row.addEventListener('click', e=>{
-      if(e.target.classList.contains('carpet-badge')) return;
-      if(S.selected.has(rn)) S.selected.delete(rn);
-      else S.selected.add(rn);
-      renderRooms(); updateCleanBtn();
-    });
-    // Toggle exclusión alfombra (solo en modo seco)
-    const badge = row.querySelector('.carpet-badge');
-    if(badge) badge.addEventListener('click', e=>{
-      e.stopPropagation();
-      if(window._mopAttached) return; // bloqueado en modo húmedo
-      if(S.excluded.has(rn)) S.excluded.delete(rn);
-      else S.excluded.add(rn);
-      renderRooms(); updateCleanBtn();
-    });
+    row.className = 'room-row' + (isSelected?' selected':'') + (isExcluded?' excl':'');
+    if(wet && isCarpet){
+      // Modo húmedo: alfombra excluida y bloqueada
+      row.innerHTML = `
+        <div class="room-check" style="color:#5E7E9A">✕</div>
+        <div class="room-name" style="color:#5E7E9A">${dn}</div>
+        <div class="carpet-badge excl-on">🚫 excl.</div>
+      `;
+      // No click handler — bloqueada
+    } else {
+      // Modo seco (o habitación normal): click para seleccionar
+      row.innerHTML = `
+        <div class="room-check">${isSelected?'✓':''}</div>
+        <div class="room-name">${dn}</div>
+        ${isCarpet?'<div class="carpet-badge" style="cursor:default">🟧</div>':''}
+      `;
+      row.addEventListener('click', e=>{
+        if(isSelected) S.selected.delete(rn);
+        else S.selected.add(rn);
+        renderRooms(); updateCleanBtn();
+      });
+    }
+    list.appendChild(row);
+  }
+}
     list.appendChild(row);
   }
 }
