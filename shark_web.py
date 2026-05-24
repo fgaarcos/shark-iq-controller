@@ -1884,7 +1884,7 @@ async function cleanRooms(){
   const hasMop    = !!(window._detectedMop);
   const cleanType = hasMop ? 'wet' : 'dry';
   const count     = rooms.filter(r=>!excluded.includes(r)).length;
-  const icon      = hasMop ? '\ud83e\uddfd' : '\ud83e\uddf9';
+  const icon      = hasMop ? '🧽' : '🧹';
   setMapStatus('<span class="spinner"></span> Iniciando limpieza...');
   log(icon+' Limpiando '+count+' hab. ('+cleanType+')');
   const d = await api('/api/clean-rooms','POST',{rooms, excluded, clean_type: cleanType});
