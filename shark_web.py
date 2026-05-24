@@ -104,20 +104,31 @@ def _build_auth_url(verifier, challenge, state_val, override_redirect=None):
     return AUTH0_URL + "/authorize?" + urllib.parse.urlencode(params)
 
 
-# ── Tokens persistentes ───────────────────────────────────────────────────────
+# ── Tokens persistentes ─────────────────────────────────────────────────────
 def _save_tokens(data: dict):
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(data, f)
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass  # en Railway el filesystem puede ser read-only
 
 
 def _load_tokens() -> dict | None:
-    if not os.path.exists(TOKEN_FILE):
-        return None
-    try:
-        with open(TOKEN_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return None
+    # 1) archivo local
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # 2) variable de entorno SHARK_TOKENS (persiste en Railway aunque se reinicie)
+    env_tokens = os.environ.get("SHARK_TOKENS", "").strip()
+    if env_tokens:
+        try:
+            return json.loads(env_tokens)
+        except Exception:
+            pass
+    return None
 
 
 # ── Inicializar sesión desde tokens guardados ─────────────────────────────────
@@ -819,6 +830,15 @@ def auth_browser_code():
 
     threading.Thread(target=_do_web, daemon=True).start()
     return jsonify({"ok": True})
+
+
+@app.route("/auth/tokens-export")
+def auth_tokens_export():
+    """Devuelve el JSON de tokens actual para guardarlo como SHARK_TOKENS en Railway."""
+    tokens = _load_tokens()
+    if not tokens:
+        return jsonify({"ok": False, "msg": "No hay tokens guardados"}), 404
+    return jsonify({"ok": True, "tokens": json.dumps(tokens)})
 
 
 @app.route("/auth/restore-tokens", methods=["POST"])
