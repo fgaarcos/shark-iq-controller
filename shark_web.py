@@ -1684,7 +1684,11 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
   <div id="roomsSection" style="display:none">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">
       <span style="font-size:13px;font-weight:700;color:#E8F3FF">Habitaciones</span>
-      <span style="font-size:11px;color:#5E7E9A">🟫 = alfombra — toca para excluir</span>
+      <span style="font-size:11px;color:#5E7E9A" id="carpetHint">🟫 = alfombra — toca para excluir</span>
+    </div>
+    <div id="wetModeNote" style="display:none;margin-top:6px;padding:7px 10px;background:#0d1a14;
+         border:1px solid #005533;border-radius:8px;font-size:11px;color:#00C878">
+      🧽 Modo húmedo: alfombras excluidas automáticamente
     </div>
     <div class="room-list" id="roomList"></div>
     <button class="btn-clean" id="cleanBtn" disabled onclick="cleanRooms()">
@@ -1742,6 +1746,9 @@ function updateStatus(d){
     }
     badge.style.display = 'block';
   }
+  // Actualizar lógica de alfombras según modo
+  window._mopAttached = !!(d.mop_attached);
+  applyMopMode();
 }
 
 // Auto-refresh every 30 s
@@ -1751,6 +1758,25 @@ setInterval(()=>{
 
 // Initial load
 doRefresh();
+
+// Aplica auto-exclusión de alfombras según modo mopa
+function applyMopMode(){
+  const wet = window._mopAttached;
+  // Hint y nota
+  const hint = document.getElementById('carpetHint');
+  const note = document.getElementById('wetModeNote');
+  if(hint) hint.textContent = wet ? '' : '🟧 = alfombra — toca para excluir';
+  if(note) note.style.display = wet ? 'block' : 'none';
+  // Auto-excluir alfombras en modo húmedo
+  if(wet){
+    S.carpet.forEach(rn => S.excluded.add(rn));
+  } else {
+    // En modo seco, quitar la auto-exclusión (sólo las que se excluyeron automáticamente)
+    S.carpet.forEach(rn => S.excluded.delete(rn));
+  }
+  if(Object.keys(S.rooms).length > 0) renderRooms();
+  updateCleanBtn();
+}
 
 // ── Comandos ──────────────────────────────────────────────────────────────────
 async function sendCmd(cmd){
@@ -1778,6 +1804,7 @@ async function loadMap(){
   S.rooms  = d.rooms || {};
   S.carpet = new Set(d.carpet_rooms || []);
   S.selected.clear(); S.excluded.clear();
+  applyMopMode(); // auto-excluir alfombras si hay almohadilla
   renderRooms();
   document.getElementById('roomsSection').style.display = 'block';
   setMapStatus('✓ Mapa cargado — '+Object.keys(S.rooms).length+' habitaciones');
@@ -1801,10 +1828,11 @@ function renderRooms(){
       else S.selected.add(rn);
       renderRooms(); updateCleanBtn();
     });
-    // Toggle exclusión alfombra
+    // Toggle exclusión alfombra (solo en modo seco)
     const badge = row.querySelector('.carpet-badge');
     if(badge) badge.addEventListener('click', e=>{
       e.stopPropagation();
+      if(window._mopAttached) return; // bloqueado en modo húmedo
       if(S.excluded.has(rn)) S.excluded.delete(rn);
       else S.excluded.add(rn);
       renderRooms(); updateCleanBtn();
