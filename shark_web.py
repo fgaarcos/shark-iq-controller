@@ -214,8 +214,14 @@ class _SkegoxWrapper:
     async def async_set_operating_mode(self, mode):
         await self._dev.async_set_operating_mode(mode)
 
-    async def async_clean_rooms(self, rooms):
-        await self._dev.async_clean_rooms(rooms)
+    async def async_clean_rooms(self, rooms, clean_type="dry"):
+        await self._dev._api.clean_rooms(
+            snd=self._dev._snd,
+            rooms=rooms,
+            floor_id=self._dev._floor_id,
+            use_v3=self._dev._has_areas_v3,
+            clean_type=clean_type,
+        )
 
 
 # ── Mapeo de modo a texto/color ───────────────────────────────────────────────
@@ -1078,20 +1084,21 @@ def api_clean_rooms():
     if not _state["authed"]:
         return jsonify({"ok": False, "msg": "No autenticado"})
     data = request.get_json() or {}
-    selected  = data.get("rooms", [])      # [robot_name, ...]
-    excluded  = set(data.get("excluded", []))  # carpet rooms to skip
-    to_clean  = [r for r in selected if r not in excluded]
+    selected   = data.get("rooms", [])          # [robot_name, ...]
+    excluded   = set(data.get("excluded", []))  # carpet rooms to skip
+    clean_type = data.get("clean_type", "dry")  # "dry" | "wet"
+    to_clean   = [r for r in selected if r not in excluded]
     if not to_clean:
         return jsonify({"ok": False, "msg": "Ninguna habitación seleccionada"})
 
     vac = _state["vacuum"]
     try:
         if hasattr(vac, "async_clean_rooms"):
-            _run_async(vac.async_clean_rooms(to_clean))
+            _run_async(vac.async_clean_rooms(to_clean, clean_type=clean_type))
         else:
             _run_async(vac.async_set_operating_mode(OperatingModes.START,
                                                      room_names=to_clean))
-        return jsonify({"ok": True, "cleaning": to_clean})
+        return jsonify({"ok": True, "cleaning": to_clean, "clean_type": clean_type})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
 
@@ -1611,6 +1618,15 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
            margin-top:12px;cursor:pointer;transition:.15s}
 .btn-clean:active{background:#00C878}
 .btn-clean:disabled{background:#141E2C;color:#5E7E9A;cursor:not-allowed}
+/* Toggle switch */
+.tog-wrap{position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0}
+.tog-wrap input{opacity:0;width:0;height:0}
+.tog-sl{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;
+        background:#1B2C40;border-radius:24px;transition:.2s}
+.tog-sl:before{position:absolute;content:"";height:18px;width:18px;left:3px;bottom:3px;
+               background:#5E7E9A;border-radius:50%;transition:.2s}
+input:checked+.tog-sl{background:#2896FF}
+input:checked+.tog-sl:before{transform:translateX(20px);background:#fff}
 /* Spinner */
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid #1B2C40;
          border-top-color:#2896FF;border-radius:50%;animation:spin .7s linear infinite;
@@ -1683,6 +1699,15 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
       <span style="font-size:11px;color:#5E7E9A">🟫 = alfombra — toca para excluir</span>
     </div>
     <div class="room-list" id="roomList"></div>
+    <div style="display:flex;align-items:center;gap:12px;margin-top:12px;padding:12px 14px;
+                background:#141E2C;border-radius:10px;border:1px solid #1B2C40">
+      <span style="font-size:20px">🧽</span>
+      <span style="flex:1;font-size:14px;font-weight:600;color:#E8F3FF">Almohadilla colocada</span>
+      <label class="tog-wrap">
+        <input type="checkbox" id="mopToggle">
+        <span class="tog-sl"></span>
+      </label>
+    </div>
     <button class="btn-clean" id="cleanBtn" disabled onclick="cleanRooms()">
       🧹 Limpiar seleccionadas
     </button>
@@ -1805,12 +1830,15 @@ function updateCleanBtn(){
 }
 
 async function cleanRooms(){
-  const rooms    = [...S.selected];
-  const excluded = [...S.excluded];
-  log('🧹 Limpiando '+rooms.filter(r=>!excluded.includes(r)).length+' habitaciones...');
-  const d = await api('/api/clean-rooms','POST',{rooms, excluded});
-  if(d.ok) log('✓ Limpieza iniciada');
-  else log('⚠ '+d.msg);
+  const rooms     = [...S.selected];
+  const excluded  = [...S.excluded];
+  const hasMop    = document.getElementById('mopToggle').checked;
+  const cleanType = hasMop ? 'wet' : 'dry';
+  const count     = rooms.filter(r=>!excluded.includes(r)).length;
+  log((hasMop ? '🧽 ' : '🧹 ') + 'Limpiando '+count+' hab. ('+cleanType+')');
+  const d = await api('/api/clean-rooms','POST',{rooms, excluded, clean_type: cleanType});
+  if(d.ok) log('\u2713 Limpieza iniciada');
+  else log('\u26a0 '+d.msg);
 }
 
 function setMapStatus(html){
