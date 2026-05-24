@@ -1357,14 +1357,10 @@ LOGIN_HTML = """<!DOCTYPE html>
 {% if is_cloud %}
   <!-- ── MODO CLOUD: OAuth web ── -->
   <div id="step-launch">
-    <a href="/auth/launch" target="_blank" rel="noopener"
-       class="btn btn-primary" id="webBtn"
-       onclick="onLaunchClick(event)"
-       style="display:block;text-decoration:none;text-align:center">
+    <button class="btn btn-primary" id="webBtn" onclick="onLaunchClick()">
       🔐 Iniciar sesión con Shark
-    </a>
-    <p class="hint" style="text-align:center">Se abrirá la página oficial de Shark en una nueva pestaña.<br>
-      <strong style="color:#FFD700">Si estás en el celular, hacé esto desde una PC.</strong></p>
+    </button>
+    <p class="hint" style="text-align:center">Funciona desde el celular y la PC.</p>
 
     <div class="divider">o</div>
     <button class="btn-ghost" onclick="toggleEmail()">📧 Intentar con email</button>
@@ -1449,28 +1445,16 @@ async function submitTokens(){
 }
 
 // ── Cloud: web OAuth ────────────────────────────────────────────────────────
-function onLaunchClick(e){
-  // El <a href="/auth/launch" target="_blank"> navega nativamente — solo actualizar UI
-  document.getElementById('webBtn').style.pointerEvents = 'none';
-  document.getElementById('webBtn').style.opacity = '0.5';
-  document.getElementById('sharkLoginLink').href = '/auth/launch';
+function onLaunchClick(){
+  // Solo mostrar step-paste con instrucciones — el usuario toca el link manualmente
   document.getElementById('step-launch').style.display = 'none';
   document.getElementById('step-paste').style.display = 'block';
   setStatus('', '');
 }
 
-function startWebOAuth(){
-  // fallback: llamar onLaunchClick y abrir manualmente
-  window.open('/auth/launch', '_blank');
-  onLaunchClick(null);
-}
-
 function resetOAuth(){
   document.getElementById('step-launch').style.display = 'block';
   document.getElementById('step-paste').style.display = 'none';
-  const wb = document.getElementById('webBtn');
-  wb.style.pointerEvents = '';
-  wb.style.opacity = '';
   document.getElementById('redirectUrlInp').value = '';
   document.getElementById('continueBtn').disabled = true;
   setStatus('', '');
