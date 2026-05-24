@@ -996,6 +996,33 @@ def api_status():
     })
 
 
+@app.route("/api/debug/properties")
+def api_debug_properties():
+    """Expone properties_full del robot para diagnóstico."""
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"})
+    vac = _state["vacuum"]
+    if vac is None:
+        return jsonify({"ok": False, "msg": "Sin robot"})
+    try:
+        dev = getattr(vac, "_dev", vac)
+        props = getattr(dev, "properties_full", {})
+        # Unwrap {"value": ...} dicts para legibilidad
+        flat = {}
+        for k, v in props.items():
+            flat[k] = v.get("value") if isinstance(v, dict) else v
+        # También mostrar room list raw
+        room_list_raw = None
+        try:
+            from sharkiq import Properties
+            room_list_raw = dev.get_property_value(Properties.ROBOT_ROOM_LIST)
+        except Exception as e:
+            room_list_raw = f"Error: {e}"
+        return jsonify({"ok": True, "properties": flat, "robot_room_list": room_list_raw})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     if not _state["authed"]:
@@ -1744,9 +1771,11 @@ function updateStatus(d){
     }
     badge.style.display = 'block';
   }
-  // Actualizar lógica de alfombras según modo
+  // Actualizar lógica de alfombras según modo — solo si cambia
+  const prevMop = window._mopAttached;
   window._mopAttached = !!(d.mop_attached);
-  applyMopMode();
+  // Solo resetear carpetExcl si cambia el modo mop
+  if(prevMop !== window._mopAttached) applyMopMode();
 }
 
 // Auto-refresh every 30 s
