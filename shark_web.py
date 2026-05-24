@@ -1844,9 +1844,6 @@ function renderRooms(){
     list.appendChild(row);
   }
 }
-    list.appendChild(row);
-  }
-}
 
 function updateCleanBtn(){
   const active = [...S.selected].filter(r=>!S.excluded.has(r));
