@@ -1815,32 +1815,50 @@ function renderRooms(){
   list.innerHTML = '';
   const wet = window._mopAttached;
   for(const [rn, dn] of Object.entries(S.rooms)){
-    const isCarpet = S.carpet.has(rn);
+    const isCarpet  = S.carpet.has(rn);
     const isExcluded = S.excluded.has(rn);
     const isSelected = S.selected.has(rn);
     const row = document.createElement('div');
     row.className = 'room-row' + (isSelected?' selected':'') + (isExcluded?' excl':'');
-    if(wet && isCarpet){
-      // Modo húmedo: alfombra excluida y bloqueada
-      row.innerHTML = `
-        <div class="room-check" style="color:#5E7E9A">✕</div>
-        <div class="room-name" style="color:#5E7E9A">${dn}</div>
-        <div class="carpet-badge excl-on">🚫 excl.</div>
-      `;
-      // No click handler — bloqueada
-    } else {
-      // Modo seco (o habitación normal): click para seleccionar
-      row.innerHTML = `
-        <div class="room-check">${isSelected?'✓':''}</div>
-        <div class="room-name">${dn}</div>
-        ${isCarpet?'<div class="carpet-badge" style="cursor:default">🟧</div>':''}
-      `;
-      row.addEventListener('click', e=>{
-        if(isSelected) S.selected.delete(rn);
-        else S.selected.add(rn);
-        renderRooms(); updateCleanBtn();
-      });
+
+    // Badge de alfombra
+    let badgeHtml = '';
+    if(isCarpet){
+      if(wet){
+        // Modo húmedo: siempre excluida, bloqueada
+        badgeHtml = '<div class="carpet-badge excl-on">🚫 excl.</div>';
+      } else if(isExcluded){
+        // Modo seco, excluida manualmente
+        badgeHtml = '<div class="carpet-badge excl-on" data-toggle="'+rn+'">🟧 excluida ↺</div>';
+      } else {
+        // Modo seco, incluida
+        badgeHtml = '<div class="carpet-badge" data-toggle="'+rn+'">🟧 incluida ↓excl</div>';
+      }
     }
+
+    row.innerHTML = `
+      <div class="room-check">${isSelected?'✓':''}</div>
+      <div class="room-name">${dn}</div>
+      ${badgeHtml}
+    `;
+
+    // Click en la fila: seleccionar/deseleccionar habitación
+    row.addEventListener('click', e=>{
+      if(e.target.dataset.toggle) return; // click en badge, no en fila
+      if(isSelected) S.selected.delete(rn);
+      else S.selected.add(rn);
+      renderRooms(); updateCleanBtn();
+    });
+
+    // Click en badge (solo modo seco): toggle excluir alfombra
+    const badge = row.querySelector('[data-toggle]');
+    if(badge) badge.addEventListener('click', e=>{
+      e.stopPropagation();
+      if(isExcluded) S.excluded.delete(rn);
+      else S.excluded.add(rn);
+      renderRooms(); updateCleanBtn();
+    });
+
     list.appendChild(row);
   }
 }
