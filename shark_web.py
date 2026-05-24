@@ -1029,8 +1029,11 @@ def api_debug_properties():
         room_list_raw = dev.get_property_value("GET_Robot_Room_List")
         floor_id = getattr(dev, '_floor_id', None)
         has_v3 = getattr(dev, '_has_areas_v3', None)
+        room_name_map = getattr(dev, '_room_name_map', None) or {}
+        robot_rooms = getattr(dev, '_rooms', None) or []
         return jsonify({"ok": True, "properties": flat, "robot_room_list": room_list_raw,
-                        "floor_id": floor_id, "has_areas_v3": has_v3})
+                        "floor_id": floor_id, "has_areas_v3": has_v3,
+                        "room_name_map": room_name_map, "robot_rooms": robot_rooms})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
 
@@ -1874,6 +1877,8 @@ async function loadMap(){
   S.rooms  = d.rooms || {};
   S.carpet = new Set(d.carpet_rooms || []);
   S.selected.clear(); S.carpetExcl.clear();
+  // Debug: mostrar mapa robot_name → display_name para diagnosticar selección errónea
+  log('🗂 Habitaciones (robot_id → nombre): '+Object.entries(S.rooms).map(([k,v])=>k+(k!==v?'→'+v:'')).join(' | '));
   applyMopMode();
   renderRooms();
   document.getElementById('roomsSection').style.display = 'block';
@@ -1908,7 +1913,7 @@ function renderRooms(){
 
     row.innerHTML = `
       <div class="room-check">${isSelected?'✓':''}</div>
-      <div class="room-name">${dn}</div>
+      <div class="room-name">${dn}${rn!==dn?'<small style="opacity:.5;font-size:.75em;display:block">id:'+rn+'</small>':''}</div>
       ${badgeHtml}
     `;
 
@@ -1950,9 +1955,9 @@ async function cleanRooms(){
   const rooms      = [...S.selected];
   const carpetExcl = [...S.carpetExcl];
   if(!rooms.length){ log('⚠ Ninguna habitación seleccionada'); return; }
-  log('🧹 Limpiando '+rooms.length+' habitación'+(rooms.length>1?'es':'')+'...');
+  log('🧹 Enviando: '+rooms.join(', '));
   const d = await api('/api/clean-rooms','POST',{rooms, carpet_excluded: carpetExcl});
-  if(d.ok) log('✓ Limpieza iniciada');
+  if(d.ok) log('✓ Robot recibirá: '+(d.cleaning||rooms).join(', '));
   else log('⚠ '+d.msg);
 }
 
