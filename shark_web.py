@@ -1697,7 +1697,7 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
 
 <script>
 // ── Estado ────────────────────────────────────────────────────────────────────
-const S = { selected: new Set(), excluded: new Set(), rooms: {}, carpet: new Set() };
+const S = { selected: new Set(), carpetExcl: new Set(), rooms: {}, carpet: new Set() };
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name){
@@ -1760,17 +1760,16 @@ doRefresh();
 // Aplica auto-exclusión de alfombras según modo mopa
 function applyMopMode(){
   const wet = window._mopAttached;
-  // Hint y nota
   const hint = document.getElementById('carpetHint');
   const note = document.getElementById('wetModeNote');
   if(hint) hint.textContent = wet ? '' : '🟧 = alfombra';
   if(note) note.style.display = wet ? 'block' : 'none';
   if(wet){
-    // Modo húmedo: excluir alfombras y deseleccionarlas
-    S.carpet.forEach(rn => { S.excluded.add(rn); S.selected.delete(rn); });
+    // Modo húmedo: todas las alfombras excluidas automáticamente
+    S.carpet.forEach(rn => S.carpetExcl.add(rn));
   } else {
-    // Modo seco: alfombras disponibles como cualquier habitación
-    S.carpet.forEach(rn => S.excluded.delete(rn));
+    // Modo seco: limpiar alfombras por defecto (usuario puede cambiar)
+    S.carpetExcl.clear();
   }
   if(Object.keys(S.rooms).length > 0) renderRooms();
   updateCleanBtn();
@@ -1801,8 +1800,8 @@ async function loadMap(){
   // Habitaciones
   S.rooms  = d.rooms || {};
   S.carpet = new Set(d.carpet_rooms || []);
-  S.selected.clear(); S.excluded.clear();
-  applyMopMode(); // auto-excluir alfombras si hay almohadilla
+  S.selected.clear(); S.carpetExcl.clear();
+  applyMopMode();
   renderRooms();
   document.getElementById('roomsSection').style.display = 'block';
   setMapStatus('✓ Mapa cargado — '+Object.keys(S.rooms).length+' habitaciones');
@@ -1815,8 +1814,53 @@ function renderRooms(){
   for(const [rn, dn] of Object.entries(S.rooms)){
     const isCarpet   = S.carpet.has(rn);
     const isSelected = S.selected.has(rn);
+    const carpetExcl = S.carpetExcl.has(rn);
     const row = document.createElement('div');
     row.className = 'room-row' + (isSelected?' selected':'');
+
+    // Badge de alfombra
+    let badgeHtml = '';
+    if(isCarpet){
+      if(wet){
+        // Modo húmedo: alfombra siempre excluida (bloqueado)
+        badgeHtml = '<div class="carpet-badge excl-on">🚫 sin alfombra</div>';
+      } else if(carpetExcl){
+        // Modo seco, alfombra excluida por usuario
+        badgeHtml = '<div class="carpet-badge excl-on" data-carpet="'+rn+'">🟧 sin alfombra ↺</div>';
+      } else {
+        // Modo seco, alfombra incluida
+        badgeHtml = '<div class="carpet-badge" data-carpet="'+rn+'">🟧 con alfombra ×</div>';
+      }
+    }
+
+    row.innerHTML = `
+      <div class="room-check">${isSelected?'✓':''}</div>
+      <div class="room-name">${dn}</div>
+      ${badgeHtml}
+    `;
+
+    // Click en la fila: seleccionar/deseleccionar habitación
+    row.addEventListener('click', e=>{
+      if(e.target.dataset.carpet) return;
+      if(isSelected) S.selected.delete(rn);
+      else S.selected.add(rn);
+      renderRooms(); updateCleanBtn();
+    });
+
+    // Click en badge alfombra (solo modo seco): toggle incluir/excluir zona de alfombra
+    if(!wet){
+      const badge = row.querySelector('[data-carpet]');
+      if(badge) badge.addEventListener('click', e=>{
+        e.stopPropagation();
+        if(carpetExcl) S.carpetExcl.delete(rn);
+        else S.carpetExcl.add(rn);
+        renderRooms(); updateCleanBtn();
+      });
+    }
+
+    list.appendChild(row);
+  }
+}
 
     let badgeHtml = '';
     if(isCarpet){
@@ -1860,9 +1904,8 @@ function renderRooms(){
 }
 
 function updateCleanBtn(){
-  // El botón se habilita con cualquier habitación seleccionada.
-  // S.excluded son zonas de alfombra a evitar DENTRO de la habitación,
-  // no habitaciones completas excluidas.
+  // El botón se habilita cuando hay habitaciones seleccionadas.
+  // S.carpetExcl es independiente: no afecta si se puede limpiar o no.
   const count = S.selected.size;
   const btn = document.getElementById('cleanBtn');
   btn.disabled = count === 0;
@@ -1872,10 +1915,11 @@ function updateCleanBtn(){
 }
 
 async function cleanRooms(){
-  const rooms = [...S.selected];
+  const rooms      = [...S.selected];
+  const carpetExcl = [...S.carpetExcl];
   if(!rooms.length){ log('⚠ Ninguna habitación seleccionada'); return; }
   log('🧹 Limpiando '+rooms.length+' habitación'+(rooms.length>1?'es':'')+'...');
-  const d = await api('/api/clean-rooms','POST',{rooms});
+  const d = await api('/api/clean-rooms','POST',{rooms, carpet_excluded: carpetExcl});
   if(d.ok) log('✓ Limpieza iniciada');
   else log('⚠ '+d.msg);
 }
