@@ -1835,10 +1835,17 @@ async function cleanRooms(){
   const hasMop    = document.getElementById('mopToggle').checked;
   const cleanType = hasMop ? 'wet' : 'dry';
   const count     = rooms.filter(r=>!excluded.includes(r)).length;
-  log((hasMop ? '🧽 ' : '🧹 ') + 'Limpiando '+count+' hab. ('+cleanType+')');
+  const icon      = hasMop ? '🧽' : '🧹';
+  setMapStatus('<span class="spinner"></span> Iniciando limpieza...');
+  log(icon+' Limpiando '+count+' hab. ('+cleanType+')');
   const d = await api('/api/clean-rooms','POST',{rooms, excluded, clean_type: cleanType});
-  if(d.ok) log('\u2713 Limpieza iniciada');
-  else log('\u26a0 '+d.msg);
+  if(d.ok){
+    setMapStatus(icon+' Limpieza iniciada &mdash; '+count+' habitaci'+(count===1?'ón':'ones')+' ('+cleanType+')');
+    log('\u2713 Limpieza iniciada');
+  } else {
+    setMapStatus('\u26a0 '+d.msg);
+    log('\u26a0 '+d.msg);
+  }
 }
 
 function setMapStatus(html){
