@@ -1774,6 +1774,7 @@ function switchTab(name){
   document.querySelectorAll('.panel').forEach(p=>{
     p.classList.toggle('active', p.id==='panel-'+name);
   });
+  if(name==='map' && Object.keys(S.rooms).length===0) loadMap();
 }
 
 // ── Status polling ────────────────────────────────────────────────────────────
