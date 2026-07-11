@@ -25,7 +25,7 @@ from flask import Flask, Response, jsonify, make_response, redirect, render_temp
 
 # ── Importar sharkiq ─────────────────────────────────────────────────────────
 try:
-    from sharkiq import get_ayla_api, OperatingModes, Properties
+    from sharkiq import get_ayla_api, OperatingModes, PowerModes, Properties
     from sharkiq.exc import SharkIqAuthError
     from sharkiq.const import (
         AUTH0_URL, AUTH0_CLIENT_ID, AUTH0_SCOPES, AUTH0_REDIRECT_URI,
@@ -62,6 +62,7 @@ _state = {
     "pkce_verifier": None,   # para OAuth web
     "pkce_redirect_uri": None,  # redirect URI usado en el último /auth/launch
     "mop_attached": None,    # GET_MopPlateAttached
+    "power_mode": None,      # PowerModes: 1=Eco, 0=Normal, 2=Máxima
 }
 _state_lock = threading.Lock()
 
@@ -107,18 +108,27 @@ def _build_auth_url(verifier, challenge, state_val, override_redirect=None):
 
 # ── Tokens persistentes ───────────────────────────────────────────────────────
 def _save_tokens(data: dict):
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(data, f)
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 
 def _load_tokens() -> dict | None:
-    if not os.path.exists(TOKEN_FILE):
-        return None
-    try:
-        with open(TOKEN_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return None
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    env_tokens = os.environ.get("SHARK_TOKENS", "").strip()
+    if env_tokens:
+        try:
+            return json.loads(env_tokens)
+        except Exception:
+            pass
+    return None
 
 
 # ── Inicializar sesión desde tokens guardados ─────────────────────────────────
@@ -204,6 +214,9 @@ class _SkegoxWrapper:
     async def async_set_operating_mode(self, mode):
         await self._dev.async_set_operating_mode(mode)
 
+    async def async_set_power_mode(self, mode):
+        await self._dev.async_set_property_value(Properties.POWER_MODE, mode)
+
     async def async_clean_rooms(self, rooms, clean_type='dry'):
         dev = self._dev
         # Respetar _has_areas_v3 de la librería — no forzar V3
@@ -275,6 +288,13 @@ def _refresh_state():
     try:
         _run_async(vac.async_update())
         mode_key, mode_text, mode_color, battery = _resolve_mode(vac)
+        power_mode = None
+        try:
+            value = vac.get_property_value(Properties.POWER_MODE)
+            if value is not None:
+                power_mode = int(value)
+        except Exception:
+            pass
         # Leer estado de la almohadilla
         mop_attached = None
         try:
@@ -300,6 +320,7 @@ def _refresh_state():
             _state["mode_color"]  = mode_color
             _state["battery"]     = battery
             _state["mop_attached"] = mop_attached
+            _state["power_mode"]   = power_mode
     except Exception as e:
         pass
 
@@ -991,7 +1012,19 @@ def dashboard():
     vac = _state["vacuum"]
     return render_template_string(DASHBOARD_HTML,
         robot_name=vac.name if vac else "Robot",
-        has_map=(_state["map_png"] is not None))
+        has_map=(_state["map_png"] is not None),
+        demo_mode=False)
+
+
+@app.route("/demo")
+def demo_dashboard():
+    """Vista local de demostración: no requiere cuenta ni controla el robot."""
+    if CLOUD:
+        return Response("Modo demo no disponible en cloud", status=404)
+    return render_template_string(DASHBOARD_HTML,
+        robot_name="Shark (modo demo)",
+        has_map=False,
+        demo_mode=True)
 
 
 @app.route("/api/status")
@@ -1007,6 +1040,7 @@ def api_status():
         "battery":     _state.get("battery"),
         "name":        vac.name,
         "mop_attached": _state.get("mop_attached"),
+        "power_mode":   _state.get("power_mode"),
     })
 
 
@@ -1070,6 +1104,32 @@ def api_command(cmd):
         _run_async(vac.async_set_operating_mode(mode))
         import time; time.sleep(1.5)
         _refresh_state()
+        return api_status()
+    except Exception as e:
+        return jsonify({"ok": False, "msg": str(e)})
+
+
+@app.route("/api/power-mode", methods=["POST"])
+def api_power_mode():
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"})
+    vac = _state["vacuum"]
+    if vac is None:
+        return jsonify({"ok": False, "msg": "Sin robot"})
+
+    requested = str((request.get_json() or {}).get("mode", "")).lower()
+    modes = {"eco": PowerModes.ECO, "normal": PowerModes.NORMAL, "max": PowerModes.MAX}
+    mode = modes.get(requested)
+    if mode is None:
+        return jsonify({"ok": False, "msg": "Potencia inválida"})
+
+    try:
+        if hasattr(vac, "async_set_power_mode"):
+            _run_async(vac.async_set_power_mode(mode))
+        else:
+            _run_async(vac.async_set_property_value(Properties.POWER_MODE, mode))
+        with _state_lock:
+            _state["power_mode"] = int(mode)
         return api_status()
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
@@ -1450,19 +1510,40 @@ LOGIN_HTML = """<!DOCTYPE html>
 
 {% else %}
   <!-- ── MODO LOCAL: navegador del PC ── -->
-  <button class="btn btn-primary" id="loginBtn" onclick="startBrowser()">
-    🖥️ Iniciar sesión en el PC
-  </button>
-  <p class="hint" style="text-align:center">Se abrirá una ventana en el PC para autenticarte.<br>
-    <strong style="color:#E8F3FF">Fijate en el escritorio del PC</strong> cuando hagas clic.</p>
+  <div id="step-launch">
+    <a href="/auth/launch" target="_blank" rel="noopener"
+       class="btn btn-primary" id="webBtn" onclick="onLaunchClick(event)"
+       style="display:block;text-decoration:none;text-align:center">
+      🔐 Iniciar sesión con Shark
+    </a>
+    <p class="hint" style="text-align:center">Usá este método si el acceso directo o por email pide verificación.</p>
 
-  <div class="divider">o</div>
-  <button class="btn-ghost" onclick="toggleEmail()">📧 Iniciar sesión con email</button>
-  <div id="emailForm">
-    <br>
-    <input class="field" type="email" id="emailInp" placeholder="Email" autocomplete="email">
-    <input class="field" type="password" id="passInp" placeholder="Contraseña" autocomplete="current-password">
-    <button class="btn btn-primary" id="emailBtn" onclick="startEmail()">Conectar</button>
+    <div class="divider">o</div>
+    <button class="btn-ghost" onclick="startBrowser()">🖥️ Intentar ventana integrada</button>
+
+    <div class="divider">o</div>
+    <button class="btn-ghost" onclick="toggleEmail()">📧 Iniciar sesión con email</button>
+    <div id="emailForm">
+      <br>
+      <input class="field" type="email" id="emailInp" placeholder="Email" autocomplete="email">
+      <input class="field" type="password" id="passInp" placeholder="Contraseña" autocomplete="current-password">
+      <button class="btn btn-primary" id="emailBtn" onclick="startEmail()">Conectar</button>
+    </div>
+  </div>
+
+  <div id="step-paste" style="display:none">
+    <p style="font-size:13px;font-weight:700;margin-bottom:10px">Completar inicio de sesión</p>
+    <ol class="steps">
+      <li>Iniciá sesión en la pestaña oficial de Shark.</li>
+      <li>Cuando el navegador no pueda abrir la página, copiá la URL completa de la barra.<br>
+        <span style="font-size:11px;color:#3A5770">Empieza con com.sharkninja.shark://...</span></li>
+      <li>Pegala aquí:</li>
+    </ol>
+    <textarea class="field" id="redirectUrlInp" rows="3"
+      placeholder="com.sharkninja.shark://...?code=..."
+      oninput="document.getElementById('continueBtn').disabled=!this.value.trim()"></textarea>
+    <button class="btn btn-primary" id="continueBtn" onclick="submitCode()" disabled>Continuar →</button>
+    <button class="btn-ghost" onclick="resetOAuth()">← Volver</button>
   </div>
 {% endif %}
 
@@ -1497,7 +1578,8 @@ function onLaunchClick(e){
   // El <a href="/auth/launch" target="_blank"> navega nativamente — solo actualizar UI
   document.getElementById('webBtn').style.pointerEvents = 'none';
   document.getElementById('webBtn').style.opacity = '0.5';
-  document.getElementById('sharkLoginLink').href = '/auth/launch';
+  const loginLink = document.getElementById('sharkLoginLink');
+  if(loginLink) loginLink.href = '/auth/launch';
   document.getElementById('step-launch').style.display = 'none';
   document.getElementById('step-paste').style.display = 'block';
   setStatus('', '');
@@ -1533,7 +1615,8 @@ async function submitCode(){
 
 // ── Local: navegador del PC ─────────────────────────────────────────────────
 function startBrowser(){
-  document.getElementById('loginBtn').disabled = true;
+  const loginBtn = document.getElementById('loginBtn');
+  if(loginBtn) loginBtn.disabled = true;
   setStatus('<span class="spinner"></span> Abriendo navegador en el PC...', '');
   polling = true;
   apiFetch('/auth/start','POST').then(()=>poll());
@@ -1644,6 +1727,14 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
         border-radius:10px;border:none;cursor:pointer;width:100%;font-weight:600}
 .btn-sm:active{background:#1B2C40}
 .btn-sm-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.power-card{background:#0C1520;border:1px solid #1B2C40;border-radius:12px;
+            margin-top:12px;padding:12px}
+.power-title{font-size:13px;font-weight:700;margin-bottom:9px}
+.power-options{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+.power-btn{background:#141E2C;color:#8FA9C1;border:1px solid #1B2C40;border-radius:9px;
+           padding:11px 5px;font-size:13px;font-weight:700;cursor:pointer}
+.power-btn.active{background:#063568;color:#fff;border-color:#2896FF}
+.power-btn:disabled{opacity:.55;cursor:wait}
 .btn-danger{background:#BD1F1F}
 .btn-danger:active{background:#FF4040}
 /* Log */
@@ -1728,6 +1819,14 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
     <button class="btn btn-pause" onclick="sendCmd('pause')">⏸ Pausar</button>
     <button class="btn btn-dock"  onclick="sendCmd('dock')">🏠 Volver a la base</button>
   </div>
+  <div class="power-card">
+    <div class="power-title">Potencia de limpieza</div>
+    <div class="power-options" id="powerOptions">
+      <button class="power-btn" data-power="eco" onclick="setPowerMode('eco')">Eco</button>
+      <button class="power-btn" data-power="normal" onclick="setPowerMode('normal')">Normal</button>
+      <button class="power-btn" data-power="max" onclick="setPowerMode('max')">Máxima</button>
+    </div>
+  </div>
   <div class="btn-sm-grid">
     <button class="btn-sm" onclick="doRefresh()">🔄 Actualizar</button>
     <button class="btn-sm" onclick="findDevice()">📍 Localizar robot</button>
@@ -1765,6 +1864,8 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
 <script>
 // ── Estado ────────────────────────────────────────────────────────────────────
 const S = { selected: new Set(), carpetExcl: new Set(), rooms: {}, carpet: new Set() };
+const DEMO_MODE = {{ 'true' if demo_mode else 'false' }};
+let demoPowerMode = 0;
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name){
@@ -1798,6 +1899,11 @@ function updateStatus(d){
   }
   document.getElementById('connDot').style.color = '#00C878';
   document.getElementById('connLbl').textContent = d.name||'Conectado';
+  if(d.power_mode !== null && d.power_mode !== undefined){
+    const names = {1:'eco', 0:'normal', 2:'max'};
+    document.querySelectorAll('.power-btn').forEach(btn=>
+      btn.classList.toggle('active', btn.dataset.power === names[d.power_mode]));
+  }
   // Indicador almohadilla
   if(d.mop_attached !== null && d.mop_attached !== undefined){
     const badge = document.getElementById('mopBadge');
@@ -1851,6 +1957,17 @@ async function sendCmd(cmd){
   log('⏳ '+labels[cmd]);
   const d = await api('/api/command/'+cmd,'POST');
   if(d.ok){ updateStatus(d); log('✓ '+d.mode_text); }
+  else log('⚠ '+d.msg);
+}
+
+async function setPowerMode(mode){
+  const labels = {eco:'Eco',normal:'Normal',max:'Máxima'};
+  const buttons = document.querySelectorAll('.power-btn');
+  buttons.forEach(btn=>btn.disabled=true);
+  log('⏳ Ajustando potencia '+labels[mode]+'...');
+  const d = await api('/api/power-mode','POST',{mode});
+  buttons.forEach(btn=>btn.disabled=false);
+  if(d.ok){ updateStatus(d); log('✓ Potencia '+labels[mode]+' seleccionada'); }
   else log('⚠ '+d.msg);
 }
 
@@ -1983,6 +2100,19 @@ function log(msg){
 
 // ── Fetch helper ──────────────────────────────────────────────────────────────
 async function api(url, method='GET', body=null){
+  if(DEMO_MODE){
+    await new Promise(resolve=>setTimeout(resolve, 180));
+    if(url === '/api/power-mode'){
+      const values = {eco:1, normal:0, max:2};
+      demoPowerMode = values[body && body.mode] ?? demoPowerMode;
+    }
+    if(url === '/api/status' || url === '/api/refresh' || url === '/api/power-mode'){
+      return {ok:true, mode:'STOP', mode_text:'● Modo demostración', mode_color:'#2896FF',
+              battery:82, name:'Shark (modo demo)', mop_attached:false,
+              power_mode:demoPowerMode};
+    }
+    return {ok:false, msg:'Esta acción no controla el robot en modo demo'};
+  }
   try {
     const opts = { method, headers: {'Content-Type':'application/json'} };
     if(body) opts.body = JSON.stringify(body);
