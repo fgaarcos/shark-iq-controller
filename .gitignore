@@ -4,6 +4,7 @@ __pycache__/
 shark_web_tokens.json
 shark_debug.log
 *.log
+shark_schedules.db
 .env
 shark_logo_b64.txt
 shark_logo.png

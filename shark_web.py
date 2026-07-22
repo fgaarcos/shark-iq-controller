@@ -15,11 +15,18 @@ import io
 import json
 import os
 import random
+import re
+import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
-from datetime import datetime, timedelta
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfoNotFoundError
 
 from flask import Flask, Response, jsonify, make_response, redirect, render_template_string, request, session, url_for
 
@@ -40,6 +47,16 @@ PORT        = int(os.environ.get("PORT", 8080))
 CLOUD       = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER") or os.environ.get("CLOUD", "")
 TOKEN_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shark_web_tokens.json")
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR    = (os.environ.get("SHARK_DATA_DIR")
+               or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+               or BASE_DIR)
+SCHEDULE_DB = os.path.join(DATA_DIR, "shark_schedules.db")
+SCHEDULE_TZ_NAME = os.environ.get("SHARK_TIMEZONE", "America/Argentina/Buenos_Aires")
+try:
+    SCHEDULE_TZ = ZoneInfo(SCHEDULE_TZ_NAME)
+except ZoneInfoNotFoundError:
+    # Argentina usa UTC-3 sin horario de verano; permite ejecutar también en Windows.
+    SCHEDULE_TZ = timezone(timedelta(hours=-3), name=SCHEDULE_TZ_NAME)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or os.urandom(24)
@@ -65,6 +82,7 @@ _state = {
     "power_mode": None,      # PowerModes: 1=Eco, 0=Normal, 2=Máxima
 }
 _state_lock = threading.Lock()
+_schedule_lock = threading.Lock()
 
 # ── Bucle asyncio en hilo secundario ─────────────────────────────────────────
 _loop = asyncio.new_event_loop()
@@ -76,6 +94,194 @@ def _run_async(coro):
     """Ejecuta una coroutine en el loop secundario y espera el resultado."""
     future = asyncio.run_coroutine_threadsafe(coro, _loop)
     return future.result(timeout=60)
+
+
+# ── Programación persistente ─────────────────────────────────────────────────
+def _schedule_connect():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    conn = sqlite3.connect(SCHEDULE_DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+@contextmanager
+def _schedule_db():
+    conn = _schedule_connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _init_schedule_db():
+    with _schedule_lock, _schedule_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                time_hm TEXT NOT NULL,
+                days_json TEXT NOT NULL,
+                rooms_json TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run_at TEXT,
+                last_run_key TEXT,
+                last_status TEXT,
+                last_message TEXT
+            )
+        """)
+
+
+def _next_schedule_run(days, time_hm, now=None):
+    now = now or datetime.now(SCHEDULE_TZ)
+    hour, minute = (int(part) for part in time_hm.split(":"))
+    for offset in range(8):
+        date_value = (now + timedelta(days=offset)).date()
+        if date_value.weekday() not in days:
+            continue
+        candidate = datetime(
+            date_value.year, date_value.month, date_value.day,
+            hour, minute, tzinfo=SCHEDULE_TZ,
+        )
+        if candidate > now:
+            return candidate.isoformat()
+    return None
+
+
+def _schedule_row(row):
+    days = json.loads(row["days_json"])
+    rooms = json.loads(row["rooms_json"])
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "time": row["time_hm"],
+        "days": days,
+        "rooms": rooms,
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "last_run_at": row["last_run_at"],
+        "last_status": row["last_status"],
+        "last_message": row["last_message"],
+        "next_run_at": _next_schedule_run(days, row["time_hm"]) if row["enabled"] else None,
+    }
+
+
+def _list_schedules():
+    with _schedule_lock, _schedule_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM schedules ORDER BY time_hm, name COLLATE NOCASE"
+        ).fetchall()
+    return [_schedule_row(row) for row in rows]
+
+
+def _validate_schedule(data, current=None):
+    merged = dict(current or {})
+    merged.update(data or {})
+    name = str(merged.get("name", "")).strip()[:60]
+    time_hm = str(merged.get("time", "")).strip()
+    days = merged.get("days", [])
+    rooms = merged.get("rooms", [])
+    enabled = bool(merged.get("enabled", True))
+    if not name:
+        raise ValueError("Escribe un nombre para la tarea")
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_hm):
+        raise ValueError("La hora no es válida")
+    if not isinstance(days, list):
+        raise ValueError("Los días no son válidos")
+    days = sorted({int(day) for day in days})
+    if not days or any(day < 0 or day > 6 for day in days):
+        raise ValueError("Selecciona al menos un día")
+    if not isinstance(rooms, list):
+        raise ValueError("Los ambientes no son válidos")
+    rooms = list(dict.fromkeys(str(room).strip() for room in rooms if str(room).strip()))
+    if not rooms:
+        raise ValueError("Selecciona al menos un ambiente")
+    return {"name": name, "time": time_hm, "days": days, "rooms": rooms, "enabled": enabled}
+
+
+def _execute_room_cleaning(selected):
+    vac = _state.get("vacuum")
+    if not _state.get("authed") or vac is None:
+        raise RuntimeError("La sesión de Shark no está conectada")
+    clean_type = "wet" if _state.get("mop_attached") else "dry"
+    if hasattr(vac, "async_clean_rooms"):
+        try:
+            _run_async(vac.async_clean_rooms(selected, clean_type=clean_type))
+        except TypeError:
+            _run_async(vac.async_clean_rooms(selected))
+    else:
+        _run_async(vac.async_set_operating_mode(
+            OperatingModes.START, room_names=selected
+        ))
+    return clean_type
+
+
+def _record_schedule_result(schedule_id, run_key, status, message):
+    now_iso = datetime.now(SCHEDULE_TZ).isoformat()
+    with _schedule_lock, _schedule_db() as conn:
+        conn.execute("""
+            UPDATE schedules
+               SET last_run_at=?, last_run_key=?, last_status=?, last_message=?
+             WHERE id=?
+        """, (now_iso, run_key, status, str(message)[:500], schedule_id))
+
+
+def _run_due_schedules():
+    now = datetime.now(SCHEDULE_TZ)
+    minute_key = now.strftime("%Y-%m-%dT%H:%M")
+    with _schedule_lock, _schedule_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM schedules WHERE enabled=1 AND time_hm=?",
+            (now.strftime("%H:%M"),),
+        ).fetchall()
+        due = []
+        for row in rows:
+            if now.weekday() not in json.loads(row["days_json"]):
+                continue
+            run_key = f"{row['id']}:{minute_key}"
+            if row["last_run_key"] == run_key:
+                continue
+            conn.execute(
+                "UPDATE schedules SET last_run_key=?, last_status=?, last_message=? WHERE id=?",
+                (run_key, "running", "Iniciando limpieza", row["id"]),
+            )
+            due.append((row, run_key))
+
+    if not due:
+        return
+
+    # Si dos tareas coinciden exactamente, combina sus ambientes en una sola misión.
+    combined_rooms = []
+    for row, _ in due:
+        for room in json.loads(row["rooms_json"]):
+            if room not in combined_rooms:
+                combined_rooms.append(room)
+    try:
+        clean_type = _execute_room_cleaning(combined_rooms)
+        for row, run_key in due:
+            own_rooms = json.loads(row["rooms_json"])
+            _record_schedule_result(
+                row["id"], run_key, "success",
+                f"Limpieza enviada ({clean_type}): {', '.join(own_rooms)}",
+            )
+    except Exception as exc:
+        for row, run_key in due:
+            _record_schedule_result(row["id"], run_key, "error", exc)
+
+
+def _schedule_worker():
+    while True:
+        try:
+            _run_due_schedules()
+        except Exception as exc:
+            print(f"[SCHEDULE] Error: {exc}", flush=True)
+        time.sleep(15)
 
 
 # ── PKCE ─────────────────────────────────────────────────────────────────────
@@ -1177,6 +1383,75 @@ def api_rooms():
     })
 
 
+@app.route("/api/schedules", methods=["GET", "POST"])
+def api_schedules():
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"}), 401
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "schedules": _list_schedules(),
+            "timezone": SCHEDULE_TZ_NAME,
+            "persistent_storage": bool(
+                os.environ.get("SHARK_DATA_DIR")
+                or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+            ),
+        })
+
+    try:
+        item = _validate_schedule(request.get_json() or {})
+        now_iso = datetime.now(SCHEDULE_TZ).isoformat()
+        schedule_id = uuid.uuid4().hex
+        with _schedule_lock, _schedule_db() as conn:
+            conn.execute("""
+                INSERT INTO schedules
+                    (id, name, time_hm, days_json, rooms_json, enabled, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                schedule_id, item["name"], item["time"],
+                json.dumps(item["days"]), json.dumps(item["rooms"], ensure_ascii=False),
+                int(item["enabled"]), now_iso, now_iso,
+            ))
+        created = next(s for s in _list_schedules() if s["id"] == schedule_id)
+        return jsonify({"ok": True, "schedule": created}), 201
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "msg": str(exc)}), 400
+
+
+@app.route("/api/schedules/<schedule_id>", methods=["PUT", "DELETE"])
+def api_schedule_item(schedule_id):
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"}), 401
+    with _schedule_lock, _schedule_db() as conn:
+        row = conn.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+    if row is None:
+        return jsonify({"ok": False, "msg": "Tarea no encontrada"}), 404
+
+    if request.method == "DELETE":
+        with _schedule_lock, _schedule_db() as conn:
+            conn.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+        return jsonify({"ok": True})
+
+    try:
+        current = _schedule_row(row)
+        item = _validate_schedule(request.get_json() or {}, current=current)
+        now_iso = datetime.now(SCHEDULE_TZ).isoformat()
+        with _schedule_lock, _schedule_db() as conn:
+            conn.execute("""
+                UPDATE schedules
+                   SET name=?, time_hm=?, days_json=?, rooms_json=?, enabled=?, updated_at=?
+                 WHERE id=?
+            """, (
+                item["name"], item["time"], json.dumps(item["days"]),
+                json.dumps(item["rooms"], ensure_ascii=False), int(item["enabled"]),
+                now_iso, schedule_id,
+            ))
+        updated = next(s for s in _list_schedules() if s["id"] == schedule_id)
+        return jsonify({"ok": True, "schedule": updated})
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "msg": str(exc)}), 400
+
+
 @app.route("/api/clean-rooms", methods=["POST"])
 def api_clean_rooms():
     if not _state["authed"]:
@@ -1186,19 +1461,8 @@ def api_clean_rooms():
     if not selected:
         return jsonify({"ok": False, "msg": "Ninguna habitación seleccionada"})
 
-    # clean_type: 'wet' excluye alfombras (modo mopa), 'dry' las incluye
-    clean_type = "wet" if _state.get("mop_attached") else "dry"
-
-    vac = _state["vacuum"]
     try:
-        if hasattr(vac, "async_clean_rooms"):
-            try:
-                _run_async(vac.async_clean_rooms(selected, clean_type=clean_type))
-            except TypeError:
-                _run_async(vac.async_clean_rooms(selected))
-        else:
-            _run_async(vac.async_set_operating_mode(OperatingModes.START,
-                                                     room_names=selected))
+        clean_type = _execute_room_cleaning(selected)
         return jsonify({"ok": True, "cleaning": selected, "clean_type": clean_type})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
@@ -1400,7 +1664,7 @@ def _try_autoload():
             _refresh_state()
             print(f"  ✓ Sesión restaurada: {vacuums[0].name}")
     except Exception as e:
-        print(f"  ⚠ No se pudo restaurar sesión: {e}")
+        print(f"  [WARN] No se pudo restaurar sesión: {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1775,7 +2039,43 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
 @keyframes spin{to{transform:rotate(360deg)}}
 /* Status bar */
 .status-bar{background:#141E2C;border-radius:8px;padding:8px 12px;margin-top:10px;
-            font-size:12px;color:#5E7E9A;text-align:center}
+             font-size:12px;color:#5E7E9A;text-align:center}
+/* Schedules */
+.schedule-head{display:flex;justify-content:space-between;align-items:center;margin-top:14px;gap:10px}
+.schedule-title{font-size:17px;font-weight:800}
+.schedule-sub{font-size:11px;color:#5E7E9A;margin-top:3px}
+.schedule-form{display:none;background:#0C1520;border:1px solid #1B2C40;border-radius:12px;
+               padding:14px;margin-top:12px}
+.schedule-form.open{display:block}
+.field-label{display:block;font-size:12px;color:#8FA9C1;font-weight:700;margin:12px 0 6px}
+.field-input{width:100%;background:#141E2C;color:#E8F3FF;border:1px solid #1B2C40;
+             border-radius:9px;padding:12px;font-size:15px;outline:none}
+.field-input:focus{border-color:#2896FF}
+.day-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}
+.day-chip{background:#141E2C;color:#8FA9C1;border:1px solid #1B2C40;border-radius:8px;
+          padding:9px 2px;text-align:center;font-size:11px;font-weight:800;cursor:pointer}
+.day-chip.selected{background:#063568;color:#fff;border-color:#2896FF}
+.schedule-rooms{display:flex;flex-direction:column;gap:6px;max-height:260px;overflow-y:auto}
+.schedule-room{background:#141E2C;border:1px solid #1B2C40;border-radius:9px;
+               padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer}
+.schedule-room.selected{border-color:#006FDE;background:#0a1a30}
+.schedule-room-mark{width:20px;height:20px;border:2px solid #5E7E9A;border-radius:5px;
+                    display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0}
+.schedule-room.selected .schedule-room-mark{background:#006FDE;border-color:#006FDE}
+.form-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:14px}
+.schedule-list{display:flex;flex-direction:column;gap:9px;margin-top:12px}
+.schedule-card{background:#0C1520;border:1px solid #1B2C40;border-radius:12px;padding:13px}
+.schedule-card.disabled{opacity:.58}
+.schedule-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.schedule-card-name{font-size:15px;font-weight:800}
+.schedule-time{font-size:20px;font-weight:800;color:#2896FF;white-space:nowrap}
+.schedule-meta{font-size:12px;color:#8FA9C1;margin-top:6px;line-height:1.45}
+.schedule-result{font-size:11px;color:#5E7E9A;margin-top:7px;border-top:1px solid #1B2C40;padding-top:7px}
+.schedule-actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px}
+.schedule-empty{background:#0C1520;border:1px dashed #1B2C40;border-radius:12px;
+                color:#5E7E9A;text-align:center;padding:28px 14px;margin-top:12px;font-size:13px}
+.storage-warn{background:#2a1d08;border:1px solid #7b5518;color:#FFCA70;border-radius:9px;
+              font-size:11px;padding:9px 11px;margin-top:10px}
 </style>
 </head>
 <body>
@@ -1810,6 +2110,7 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
 <div class="tabs">
   <div class="tab active" onclick="switchTab('control')">Control</div>
   <div class="tab" onclick="switchTab('map')">Mapa</div>
+  <div class="tab" onclick="switchTab('schedule')">Programar</div>
 </div>
 
 <!-- Panel: Control -->
@@ -1861,21 +2162,57 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
   </div>
 </div>
 
+<!-- Panel: Programación -->
+<div class="panel" id="panel-schedule">
+  <div class="schedule-head">
+    <div>
+      <div class="schedule-title">Tareas programadas</div>
+      <div class="schedule-sub">Varias tareas por día, cada una con sus ambientes</div>
+    </div>
+    <button class="btn-sm" style="width:auto;padding:10px 14px" onclick="openScheduleForm()">＋ Nueva</button>
+  </div>
+  <div id="scheduleStorageWarning"></div>
+
+  <div class="schedule-form" id="scheduleForm">
+    <div style="font-size:15px;font-weight:800" id="scheduleFormTitle">Nueva tarea</div>
+    <label class="field-label" for="scheduleName">Nombre</label>
+    <input class="field-input" id="scheduleName" maxlength="60" placeholder="Ej. Cocina después de cenar">
+    <label class="field-label" for="scheduleTime">Hora</label>
+    <input class="field-input" id="scheduleTime" type="time" value="09:00">
+    <div class="field-label">Días</div>
+    <div class="day-grid" id="scheduleDays"></div>
+    <div class="field-label">Ambientes</div>
+    <div class="schedule-rooms" id="scheduleRooms">
+      <div class="schedule-sub">Cargando ambientes...</div>
+    </div>
+    <div class="form-actions">
+      <button class="btn-sm" onclick="closeScheduleForm()">Cancelar</button>
+      <button class="btn-sm" style="background:#007A50;color:#fff" onclick="saveSchedule()">Guardar tarea</button>
+    </div>
+  </div>
+
+  <div class="schedule-list" id="scheduleList">
+    <div class="schedule-empty"><span class="spinner"></span> Cargando tareas...</div>
+  </div>
+</div>
+
 <script>
 // ── Estado ────────────────────────────────────────────────────────────────────
-const S = { selected: new Set(), carpetExcl: new Set(), rooms: {}, carpet: new Set() };
+const S = { selected: new Set(), carpetExcl: new Set(), rooms: {}, carpet: new Set(),
+            schedules: [], scheduleDays: new Set(), scheduleRooms: new Set(), scheduleEditing: null };
 const DEMO_MODE = {{ 'true' if demo_mode else 'false' }};
 let demoPowerMode = 0;
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name){
   document.querySelectorAll('.tab').forEach((t,i)=>{
-    t.classList.toggle('active', ['control','map'][i]===name);
+    t.classList.toggle('active', ['control','map','schedule'][i]===name);
   });
   document.querySelectorAll('.panel').forEach(p=>{
     p.classList.toggle('active', p.id==='panel-'+name);
   });
   if(name==='map' && Object.keys(S.rooms).length===0) loadMap();
+  if(name==='schedule') prepareSchedules();
 }
 
 // ── Status polling ────────────────────────────────────────────────────────────
@@ -2084,6 +2421,179 @@ function setMapStatus(html){
 }
 
 // ── Logout ────────────────────────────────────────────────────────────────────
+const DAY_NAMES = ['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'];
+
+function esc(value){
+  return String(value ?? '').replace(/[&<>"']/g, ch=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[ch]));
+}
+
+async function prepareSchedules(){
+  if(Object.keys(S.rooms).length===0){
+    let roomData = await api('/api/rooms');
+    S.rooms = roomData.rooms || {};
+    S.carpet = new Set(roomData.carpet_rooms || []);
+    if(Object.keys(S.rooms).length===0){
+      roomData = await api('/api/map','POST');
+      if(roomData.ok){
+        S.rooms = roomData.rooms || {};
+        S.carpet = new Set(roomData.carpet_rooms || []);
+      }
+    }
+  }
+  renderScheduleRooms();
+  await loadSchedules();
+}
+
+function renderScheduleDays(){
+  const host = document.getElementById('scheduleDays');
+  host.innerHTML = '';
+  DAY_NAMES.forEach((name, day)=>{
+    const chip = document.createElement('div');
+    chip.className = 'day-chip'+(S.scheduleDays.has(day)?' selected':'');
+    chip.textContent = name;
+    chip.addEventListener('click', ()=>{
+      if(S.scheduleDays.has(day)) S.scheduleDays.delete(day);
+      else S.scheduleDays.add(day);
+      renderScheduleDays();
+    });
+    host.appendChild(chip);
+  });
+}
+
+function renderScheduleRooms(){
+  const host = document.getElementById('scheduleRooms');
+  host.innerHTML = '';
+  const entries = Object.entries(S.rooms);
+  if(!entries.length){
+    host.innerHTML = '<div class="schedule-sub">No se pudieron cargar los ambientes. Abre primero la pestaña Mapa.</div>';
+    return;
+  }
+  entries.forEach(([roomId, displayName])=>{
+    const selected = S.scheduleRooms.has(roomId);
+    const row = document.createElement('div');
+    row.className = 'schedule-room'+(selected?' selected':'');
+    const mark = document.createElement('div');
+    mark.className = 'schedule-room-mark';
+    mark.textContent = selected ? '✓' : '';
+    const label = document.createElement('div');
+    label.textContent = displayName;
+    row.append(mark, label);
+    row.addEventListener('click', ()=>{
+      if(S.scheduleRooms.has(roomId)) S.scheduleRooms.delete(roomId);
+      else S.scheduleRooms.add(roomId);
+      renderScheduleRooms();
+    });
+    host.appendChild(row);
+  });
+}
+
+function openScheduleForm(item=null){
+  S.scheduleEditing = item ? item.id : null;
+  S.scheduleDays = new Set(item ? item.days : [(new Date().getDay()+6)%7]);
+  S.scheduleRooms = new Set(item ? item.rooms : []);
+  document.getElementById('scheduleFormTitle').textContent = item ? 'Editar tarea' : 'Nueva tarea';
+  document.getElementById('scheduleName').value = item ? item.name : '';
+  document.getElementById('scheduleTime').value = item ? item.time : '09:00';
+  document.getElementById('scheduleForm').classList.add('open');
+  renderScheduleDays();
+  renderScheduleRooms();
+  document.getElementById('scheduleName').focus();
+}
+
+function closeScheduleForm(){
+  S.scheduleEditing = null;
+  document.getElementById('scheduleForm').classList.remove('open');
+}
+
+async function saveSchedule(){
+  const payload = {
+    name: document.getElementById('scheduleName').value.trim(),
+    time: document.getElementById('scheduleTime').value,
+    days: [...S.scheduleDays],
+    rooms: [...S.scheduleRooms],
+  };
+  if(!S.scheduleEditing) payload.enabled = true;
+  const url = S.scheduleEditing ? '/api/schedules/'+S.scheduleEditing : '/api/schedules';
+  const method = S.scheduleEditing ? 'PUT' : 'POST';
+  const result = await api(url, method, payload);
+  if(!result.ok){ alert(result.msg || 'No se pudo guardar la tarea'); return; }
+  closeScheduleForm();
+  await loadSchedules();
+}
+
+async function loadSchedules(){
+  const result = await api('/api/schedules');
+  if(!result.ok){
+    document.getElementById('scheduleList').innerHTML =
+      '<div class="schedule-empty">⚠ '+esc(result.msg || 'No se pudieron cargar las tareas')+'</div>';
+    return;
+  }
+  S.schedules = result.schedules || [];
+  const warning = document.getElementById('scheduleStorageWarning');
+  warning.innerHTML = result.persistent_storage ? '' :
+    '<div class="storage-warn">⚠ Para conservar las tareas después de un nuevo despliegue, configura un volumen persistente en Railway.</div>';
+  renderSchedules();
+}
+
+function scheduleWhen(item){ return item.days.map(day=>DAY_NAMES[day]).join(', '); }
+function scheduleRoomNames(item){ return item.rooms.map(room=>S.rooms[room] || room).join(', '); }
+
+function formatNextRun(value){
+  if(!value) return 'Sin próxima ejecución';
+  return 'Próxima: '+new Date(value).toLocaleString('es-AR',{
+    weekday:'short',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'
+  });
+}
+
+function renderSchedules(){
+  const host = document.getElementById('scheduleList');
+  if(!S.schedules.length){
+    host.innerHTML = '<div class="schedule-empty">Todavía no hay tareas.<br>Crea una y elige sus ambientes.</div>';
+    return;
+  }
+  host.innerHTML = S.schedules.map(item=>{
+    const last = item.last_run_at
+      ? ((item.last_status==='success'?'✓ ':'⚠ ')+(item.last_message || 'Ejecutada'))
+      : 'Aún no se ejecutó';
+    return `<div class="schedule-card ${item.enabled?'':'disabled'}">
+      <div class="schedule-card-top">
+        <div><div class="schedule-card-name">${esc(item.name)}</div>
+             <div class="schedule-meta">${esc(scheduleWhen(item))}</div></div>
+        <div class="schedule-time">${esc(item.time)}</div>
+      </div>
+      <div class="schedule-meta">🧹 ${esc(scheduleRoomNames(item))}</div>
+      <div class="schedule-meta">${esc(formatNextRun(item.next_run_at))}</div>
+      <div class="schedule-result">${esc(last)}</div>
+      <div class="schedule-actions">
+        <button class="btn-sm" onclick="editSchedule('${item.id}')">Editar</button>
+        <button class="btn-sm" onclick="toggleSchedule('${item.id}',${!item.enabled})">${item.enabled?'Pausar':'Activar'}</button>
+        <button class="btn-sm btn-danger" onclick="deleteSchedule('${item.id}')">Eliminar</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function editSchedule(id){
+  const item = S.schedules.find(schedule=>schedule.id===id);
+  if(item) openScheduleForm(item);
+}
+
+async function toggleSchedule(id, enabled){
+  const result = await api('/api/schedules/'+id,'PUT',{enabled});
+  if(!result.ok){ alert(result.msg || 'No se pudo actualizar la tarea'); return; }
+  await loadSchedules();
+}
+
+async function deleteSchedule(id){
+  const item = S.schedules.find(schedule=>schedule.id===id);
+  if(!confirm('¿Eliminar la tarea "'+(item?.name || '')+'"?')) return;
+  const result = await api('/api/schedules/'+id,'DELETE');
+  if(!result.ok){ alert(result.msg || 'No se pudo eliminar la tarea'); return; }
+  await loadSchedules();
+}
+
 async function doLogout(){
   if(!confirm('¿Cerrar sesión?')) return;
   await api('/auth/logout','POST');
@@ -2126,11 +2636,14 @@ async function api(url, method='GET', body=null){
 
 # ── Inicialización al importar (gunicorn arranca aquí) ───────────────────────
 def _startup():
-    if SHARKIQ_OK:
+    _init_schedule_db()
+    if not os.environ.get("SHARK_DISABLE_SCHEDULER"):
+        threading.Thread(target=_schedule_worker, daemon=True, name="shark-scheduler").start()
+    if SHARKIQ_OK and not os.environ.get("SHARK_SKIP_AUTOLOAD"):
         try:
             _try_autoload()
         except Exception as e:
-            print(f"[STARTUP] ⚠ {e}", flush=True)
+            print(f"[STARTUP] WARN: {e}", flush=True)
 
 _startup()
 
