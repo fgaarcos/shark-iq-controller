@@ -1682,24 +1682,6 @@ def api_notifications():
         return jsonify({"ok": False, "msg": "Límite inválido"}), 400
 
 
-@app.route("/api/notifications/test", methods=["POST"])
-def api_notification_test():
-    if not _state["authed"]:
-        return jsonify({"ok": False, "msg": "No autenticado"}), 401
-    now_iso = datetime.now(SCHEDULE_TZ).isoformat()
-    notification_id = uuid.uuid4().hex
-    with _schedule_lock, _schedule_db() as conn:
-        conn.execute("""
-            INSERT INTO notifications
-                (id, mission_id, kind, title, message, created_at)
-            VALUES (?, NULL, 'success', ?, ?, ?)
-        """, (
-            notification_id, "Aviso de prueba",
-            "El centro de notificaciones está funcionando correctamente.", now_iso,
-        ))
-    return jsonify({"ok": True, "notification_id": notification_id}), 201
-
-
 @app.route("/api/notifications/<notification_id>/read", methods=["POST"])
 def api_notification_read(notification_id):
     if not _state["authed"]:
@@ -2472,7 +2454,6 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
     <div class="notification-head">
       <div class="notification-title">Notificaciones</div>
       <div class="notification-actions">
-        <button class="btn-sm" style="width:auto;padding:9px" onclick="sendTestNotification()">Probar</button>
         <button class="btn-sm" style="width:auto;padding:9px" onclick="markAllNotificationsRead()">Leer todas</button>
         <button class="btn-sm" style="width:auto;padding:9px 12px" onclick="closeNotifications()">✕</button>
       </div>
@@ -2681,12 +2662,6 @@ async function markNotificationRead(id){
 
 async function markAllNotificationsRead(){
   await api('/api/notifications/read-all','POST');
-  await loadNotifications();
-}
-
-async function sendTestNotification(){
-  const result = await api('/api/notifications/test','POST');
-  if(!result.ok){ alert(result.msg || 'No se pudo crear el aviso de prueba'); return; }
   await loadNotifications();
 }
 
