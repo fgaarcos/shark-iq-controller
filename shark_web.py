@@ -135,6 +135,151 @@ def _init_schedule_db():
                 last_message TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cleaning_missions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                rooms_json TEXT NOT NULL,
+                schedule_ids_json TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                seen_running INTEGER NOT NULL DEFAULT 0,
+                last_mode TEXT,
+                completed_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                mission_id TEXT,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                read_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_notifications_created
+            ON notifications(created_at DESC)
+        """)
+
+
+def _create_cleaning_mission(source, title, rooms=None, schedule_ids=None):
+    """Registra una limpieza y devuelve su id para seguirla hasta el final."""
+    mission_id = uuid.uuid4().hex
+    now_iso = datetime.now(SCHEDULE_TZ).isoformat()
+    if _active_cleaning_mission() is not None:
+        _finish_active_mission("interrupted", "REPLACED")
+    with _schedule_lock, _schedule_db() as conn:
+        conn.execute("""
+            INSERT INTO cleaning_missions
+                (id, source, title, rooms_json, schedule_ids_json, started_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+        """, (
+            mission_id, source, title,
+            json.dumps(list(rooms or []), ensure_ascii=False),
+            json.dumps(list(schedule_ids or [])), now_iso,
+        ))
+    return mission_id
+
+
+def _active_cleaning_mission():
+    with _schedule_lock, _schedule_db() as conn:
+        return conn.execute("""
+            SELECT * FROM cleaning_missions
+             WHERE status IN ('pending', 'running')
+             ORDER BY started_at DESC LIMIT 1
+        """).fetchone()
+
+
+def _room_display_names(rooms):
+    known = _state.get("rooms") or {}
+    return [known.get(room, room) for room in rooms]
+
+
+def _finish_active_mission(result="completed", mode=None, error_code=None):
+    """Cierra la misión activa y crea una notificación persistente."""
+    now_iso = datetime.now(SCHEDULE_TZ).isoformat()
+    with _schedule_lock, _schedule_db() as conn:
+        row = conn.execute("""
+            SELECT * FROM cleaning_missions
+             WHERE status IN ('pending', 'running')
+             ORDER BY started_at DESC LIMIT 1
+        """).fetchone()
+        if row is None:
+            return None
+
+        rooms = json.loads(row["rooms_json"])
+        schedule_ids = json.loads(row["schedule_ids_json"])
+        room_names = _room_display_names(rooms)
+        if result == "interrupted":
+            title = "Limpieza interrumpida"
+            detail = "La tarea se detuvo y el robot está regresando a la base."
+            kind = "warning"
+            schedule_status = "interrupted"
+        elif result == "error":
+            title = "Limpieza terminada con una alerta"
+            detail = f"El robot dejó de limpiar e informó el error {error_code}."
+            kind = "warning"
+            schedule_status = "error"
+        else:
+            title = "Limpieza finalizada"
+            detail = "El robot confirmó que la tarea terminó."
+            kind = "success"
+            schedule_status = "completed"
+        scope = ", ".join(room_names) if room_names else "Toda la casa"
+        message = f"{row['title']} · {scope}. {detail}"
+        conn.execute("""
+            UPDATE cleaning_missions
+               SET status=?, last_mode=?, completed_at=?
+             WHERE id=?
+        """, (result, mode, now_iso, row["id"]))
+        notification_id = uuid.uuid4().hex
+        conn.execute("""
+            INSERT INTO notifications
+                (id, mission_id, kind, title, message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (notification_id, row["id"], kind, title, message, now_iso))
+        for schedule_id in schedule_ids:
+            conn.execute("""
+                UPDATE schedules
+                   SET last_status=?, last_message=?
+                 WHERE id=?
+            """, (schedule_status, message[:500], schedule_id))
+    return notification_id
+
+
+def _sync_active_mission(mode, error_code=None):
+    """Actualiza el seguimiento usando el estado real informado por el robot."""
+    row = _active_cleaning_mission()
+    if row is None:
+        return
+    cleaning_modes = {"START", "CLEAN", "CLEANING", "MOP", "VACUUM", "VACUUM_AND_MOP"}
+    terminal_modes = {"STOP", "RETURN", "RECHARGING"}
+    if mode in cleaning_modes:
+        with _schedule_lock, _schedule_db() as conn:
+            conn.execute("""
+                UPDATE cleaning_missions
+                   SET status='running', seen_running=1, last_mode=?
+                 WHERE id=?
+            """, (mode, row["id"]))
+    elif mode in terminal_modes and row["seen_running"]:
+        result = "error" if error_code not in (None, 0, "0", "") else "completed"
+        _finish_active_mission(result, mode, error_code)
+
+
+def _list_notifications(limit=50):
+    limit = max(1, min(int(limit), 100))
+    with _schedule_lock, _schedule_db() as conn:
+        rows = conn.execute("""
+            SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+        unread = conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE read_at IS NULL"
+        ).fetchone()[0]
+    return [dict(row) for row in rows], unread
 
 
 def _next_schedule_run(days, time_hm, now=None):
@@ -264,11 +409,17 @@ def _run_due_schedules():
                 combined_rooms.append(room)
     try:
         clean_type = _execute_room_cleaning(combined_rooms)
+        task_names = [row["name"] for row, _ in due]
+        mission_title = task_names[0] if len(task_names) == 1 else "Tareas: " + ", ".join(task_names)
+        _create_cleaning_mission(
+            "scheduled", mission_title, combined_rooms,
+            schedule_ids=[row["id"] for row, _ in due],
+        )
         for row, run_key in due:
             own_rooms = json.loads(row["rooms_json"])
             _record_schedule_result(
-                row["id"], run_key, "success",
-                f"Limpieza enviada ({clean_type}): {', '.join(own_rooms)}",
+                row["id"], run_key, "running",
+                f"Limpieza iniciada ({clean_type}): {', '.join(own_rooms)}",
             )
     except Exception as exc:
         for row, run_key in due:
@@ -282,6 +433,17 @@ def _schedule_worker():
         except Exception as exc:
             print(f"[SCHEDULE] Error: {exc}", flush=True)
         time.sleep(15)
+
+
+def _mission_monitor_worker():
+    """Consulta el robot solo mientras hay una limpieza iniciada por esta app."""
+    while True:
+        try:
+            if _state.get("authed") and _active_cleaning_mission() is not None:
+                _refresh_state()
+        except Exception as exc:
+            print(f"[MISSION] Error: {exc}", flush=True)
+        time.sleep(30)
 
 
 # ── PKCE ─────────────────────────────────────────────────────────────────────
@@ -501,6 +663,21 @@ def _refresh_state():
                 power_mode = int(value)
         except Exception:
             pass
+        error_code = None
+        try:
+            error_code = getattr(vac, "error_code", None)
+            if callable(error_code):
+                error_code = error_code()
+        except Exception:
+            error_code = None
+        if error_code is None:
+            for property_name in ("GET_Error_Code", "Error_Code"):
+                try:
+                    error_code = vac.get_property_value(property_name)
+                    if error_code is not None:
+                        break
+                except Exception:
+                    pass
         # Leer estado de la almohadilla
         mop_attached = None
         try:
@@ -527,6 +704,7 @@ def _refresh_state():
             _state["battery"]     = battery
             _state["mop_attached"] = mop_attached
             _state["power_mode"]   = power_mode
+        _sync_active_mission(mode_key, error_code)
     except Exception as e:
         pass
 
@@ -1308,6 +1486,10 @@ def api_command(cmd):
 
     try:
         _run_async(vac.async_set_operating_mode(mode))
+        if cmd == "start":
+            _create_cleaning_mission("manual", "Limpieza manual", [])
+        elif cmd == "dock":
+            _finish_active_mission("interrupted", "RETURN")
         import time; time.sleep(1.5)
         _refresh_state()
         return api_status()
@@ -1381,6 +1563,45 @@ def api_rooms():
         "rooms":        _state["rooms"],
         "carpet_rooms": list(_state["carpet_rooms"]),
     })
+
+
+@app.route("/api/notifications")
+def api_notifications():
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"}), 401
+    try:
+        notifications, unread = _list_notifications(request.args.get("limit", 50))
+        return jsonify({
+            "ok": True,
+            "notifications": notifications,
+            "unread_count": unread,
+        })
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "msg": "Límite inválido"}), 400
+
+
+@app.route("/api/notifications/<notification_id>/read", methods=["POST"])
+def api_notification_read(notification_id):
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"}), 401
+    with _schedule_lock, _schedule_db() as conn:
+        result = conn.execute("""
+            UPDATE notifications SET read_at=COALESCE(read_at, ?) WHERE id=?
+        """, (datetime.now(SCHEDULE_TZ).isoformat(), notification_id))
+    if not result.rowcount:
+        return jsonify({"ok": False, "msg": "Notificación no encontrada"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/notifications/read-all", methods=["POST"])
+def api_notifications_read_all():
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"}), 401
+    with _schedule_lock, _schedule_db() as conn:
+        conn.execute("""
+            UPDATE notifications SET read_at=? WHERE read_at IS NULL
+        """, (datetime.now(SCHEDULE_TZ).isoformat(),))
+    return jsonify({"ok": True})
 
 
 @app.route("/api/schedules", methods=["GET", "POST"])
@@ -1463,7 +1684,13 @@ def api_clean_rooms():
 
     try:
         clean_type = _execute_room_cleaning(selected)
-        return jsonify({"ok": True, "cleaning": selected, "clean_type": clean_type})
+        mission_id = _create_cleaning_mission(
+            "manual", "Limpieza de ambientes", selected,
+        )
+        return jsonify({
+            "ok": True, "cleaning": selected, "clean_type": clean_type,
+            "mission_id": mission_id,
+        })
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)})
 
@@ -1953,9 +2180,35 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
      justify-content:space-between;padding:0 18px;position:sticky;top:0;z-index:10}
 .hdr-logo{font-size:22px;font-weight:800;color:#fff;letter-spacing:1px}
 .hdr-logo span{font-size:11px;font-weight:400;color:#AAD4FF;display:block;letter-spacing:0}
+.hdr-actions{display:flex;align-items:center;gap:12px}
 .conn{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
 .conn-dot{font-size:18px}
 .conn-lbl{font-size:11px;color:#AAD4FF}
+.notification-btn{position:relative;width:42px;height:42px;border-radius:12px;border:1px solid #3A8BE8;
+                  background:#064AA3;color:#fff;font-size:20px;cursor:pointer}
+.notification-badge{display:none;position:absolute;right:-5px;top:-5px;min-width:20px;height:20px;
+                    padding:0 5px;border-radius:10px;background:#FF4040;color:#fff;font-size:11px;
+                    font-weight:800;align-items:center;justify-content:center;border:2px solid #0055CC}
+.notification-badge.show{display:flex}
+.notification-overlay{display:none;position:fixed;inset:0;background:rgba(2,7,14,.72);z-index:30}
+.notification-overlay.open{display:block}
+.notification-drawer{position:absolute;right:0;top:0;width:min(430px,100%);height:100%;overflow-y:auto;
+                     background:#070D18;border-left:1px solid #1B2C40;padding:18px 14px 28px}
+.notification-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.notification-title{font-size:19px;font-weight:800}
+.notification-actions{display:flex;gap:7px}
+.notification-browser{display:none;background:#0B2A49;border:1px solid #225D91;border-radius:10px;
+                      color:#AAD4FF;padding:10px 12px;margin-bottom:10px;font-size:12px;line-height:1.4}
+.notification-browser.show{display:block}
+.notification-list{display:flex;flex-direction:column;gap:8px}
+.notification-item{background:#0C1520;border:1px solid #1B2C40;border-radius:12px;padding:12px;cursor:pointer}
+.notification-item.unread{border-color:#227DCE;background:#0B1B2C}
+.notification-item-top{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.notification-item-title{font-size:14px;font-weight:800}
+.notification-dot{width:8px;height:8px;border-radius:50%;background:#2896FF;flex-shrink:0}
+.notification-message{font-size:12px;color:#8FA9C1;line-height:1.45;margin-top:5px}
+.notification-time{font-size:10px;color:#5E7E9A;margin-top:7px}
+.notification-empty{color:#5E7E9A;text-align:center;padding:45px 15px;font-size:13px}
 /* Robot card */
 .card{background:#0C1520;border:1px solid #1B2C40;border-radius:14px;
       margin:14px 12px 0;padding:16px}
@@ -2083,10 +2336,34 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
   <div>
     <div class="hdr-logo">SHARK <span>IQ Controller</span></div>
   </div>
-  <div class="conn">
-    <div class="conn-dot" id="connDot">●</div>
-    <div class="conn-lbl" id="connLbl">Conectando...</div>
+  <div class="hdr-actions">
+    <button class="notification-btn" onclick="openNotifications()" aria-label="Notificaciones">
+      🔔<span class="notification-badge" id="notificationBadge">0</span>
+    </button>
+    <div class="conn">
+      <div class="conn-dot" id="connDot">●</div>
+      <div class="conn-lbl" id="connLbl">Conectando...</div>
+    </div>
   </div>
+</div>
+
+<div class="notification-overlay" id="notificationOverlay" onclick="closeNotifications(event)">
+  <aside class="notification-drawer" role="dialog" aria-label="Centro de notificaciones">
+    <div class="notification-head">
+      <div class="notification-title">Notificaciones</div>
+      <div class="notification-actions">
+        <button class="btn-sm" style="width:auto;padding:9px" onclick="markAllNotificationsRead()">Leer todas</button>
+        <button class="btn-sm" style="width:auto;padding:9px 12px" onclick="closeNotifications()">✕</button>
+      </div>
+    </div>
+    <div class="notification-browser" id="notificationBrowser">
+      Recibe un aviso aunque estés viendo otra pestaña.
+      <button class="btn-sm" style="margin-top:8px" onclick="enableBrowserNotifications()">Activar avisos del navegador</button>
+    </div>
+    <div class="notification-list" id="notificationList">
+      <div class="notification-empty">Cargando...</div>
+    </div>
+  </aside>
 </div>
 
 <!-- Robot card -->
@@ -2199,9 +2476,92 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
 <script>
 // ── Estado ────────────────────────────────────────────────────────────────────
 const S = { selected: new Set(), carpetExcl: new Set(), rooms: {}, carpet: new Set(),
-            schedules: [], scheduleDays: new Set(), scheduleRooms: new Set(), scheduleEditing: null };
+            schedules: [], scheduleDays: new Set(), scheduleRooms: new Set(), scheduleEditing: null,
+            notifications: [], knownNotificationIds: new Set(), notificationsLoaded: false };
 const DEMO_MODE = {{ 'true' if demo_mode else 'false' }};
 let demoPowerMode = 0;
+
+// ── Notificaciones ───────────────────────────────────────────────────────────
+function openNotifications(){
+  document.getElementById('notificationOverlay').classList.add('open');
+  updateBrowserNotificationPrompt();
+  loadNotifications();
+}
+
+function closeNotifications(event){
+  const overlay = document.getElementById('notificationOverlay');
+  if(event && event.target !== overlay) return;
+  overlay.classList.remove('open');
+}
+
+function updateBrowserNotificationPrompt(){
+  const host = document.getElementById('notificationBrowser');
+  host.classList.toggle('show', 'Notification' in window && Notification.permission === 'default');
+}
+
+async function enableBrowserNotifications(){
+  if(!('Notification' in window)) return;
+  await Notification.requestPermission();
+  updateBrowserNotificationPrompt();
+}
+
+function showBrowserNotification(item){
+  if(!('Notification' in window) || Notification.permission !== 'granted') return;
+  try { new Notification(item.title, {body:item.message, tag:item.id}); } catch(e) {}
+}
+
+function formatNotificationTime(value){
+  if(!value) return '';
+  return new Date(value).toLocaleString('es-AR', {
+    day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'
+  });
+}
+
+function renderNotifications(unreadCount){
+  const badge = document.getElementById('notificationBadge');
+  badge.textContent = unreadCount > 99 ? '99+' : unreadCount;
+  badge.classList.toggle('show', unreadCount > 0);
+  const host = document.getElementById('notificationList');
+  if(!S.notifications.length){
+    host.innerHTML = '<div class="notification-empty">Las tareas terminadas aparecerán aquí.</div>';
+    return;
+  }
+  host.innerHTML = S.notifications.map(item=>`
+    <div class="notification-item ${item.read_at?'':'unread'}" onclick="markNotificationRead('${item.id}')">
+      <div class="notification-item-top">
+        <div class="notification-item-title">${item.kind==='success'?'✓':'⚠'} ${esc(item.title)}</div>
+        ${item.read_at?'':'<div class="notification-dot"></div>'}
+      </div>
+      <div class="notification-message">${esc(item.message)}</div>
+      <div class="notification-time">${esc(formatNotificationTime(item.created_at))}</div>
+    </div>`).join('');
+}
+
+async function loadNotifications(){
+  const result = await api('/api/notifications');
+  if(!result.ok) return;
+  const items = result.notifications || [];
+  if(S.notificationsLoaded){
+    items.filter(item=>!item.read_at && !S.knownNotificationIds.has(item.id))
+         .forEach(showBrowserNotification);
+  }
+  items.forEach(item=>S.knownNotificationIds.add(item.id));
+  S.notificationsLoaded = true;
+  S.notifications = items;
+  renderNotifications(result.unread_count || 0);
+}
+
+async function markNotificationRead(id){
+  const item = S.notifications.find(entry=>entry.id===id);
+  if(!item || item.read_at) return;
+  await api('/api/notifications/'+id+'/read','POST');
+  await loadNotifications();
+}
+
+async function markAllNotificationsRead(){
+  await api('/api/notifications/read-all','POST');
+  await loadNotifications();
+}
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 function switchTab(name){
@@ -2266,9 +2626,11 @@ function updateStatus(d){
 setInterval(()=>{
   api('/api/refresh','POST').then(d=>{ if(d.ok) updateStatus(d); });
 }, 30000);
+setInterval(loadNotifications, 15000);
 
 // Initial load
 doRefresh();
+loadNotifications();
 
 // Aplica auto-exclusión de alfombras según modo mopa
 function applyMopMode(){
@@ -2554,8 +2916,10 @@ function renderSchedules(){
     return;
   }
   host.innerHTML = S.schedules.map(item=>{
+    const statusIcon = item.last_status==='completed' ? '✓ '
+      : item.last_status==='running' ? '⏳ ' : '⚠ ';
     const last = item.last_run_at
-      ? ((item.last_status==='success'?'✓ ':'⚠ ')+(item.last_message || 'Ejecutada'))
+      ? (statusIcon+(item.last_message || 'Ejecutada'))
       : 'Aún no se ejecutó';
     return `<div class="schedule-card ${item.enabled?'':'disabled'}">
       <div class="schedule-card-top">
@@ -2621,6 +2985,10 @@ async function api(url, method='GET', body=null){
               battery:82, name:'Shark (modo demo)', mop_attached:false,
               power_mode:demoPowerMode};
     }
+    if(url === '/api/notifications'){
+      return {ok:true, notifications:[], unread_count:0};
+    }
+    if(url.startsWith('/api/notifications/')) return {ok:true};
     return {ok:false, msg:'Esta acción no controla el robot en modo demo'};
   }
   try {
@@ -2639,6 +3007,9 @@ def _startup():
     _init_schedule_db()
     if not os.environ.get("SHARK_DISABLE_SCHEDULER"):
         threading.Thread(target=_schedule_worker, daemon=True, name="shark-scheduler").start()
+        threading.Thread(
+            target=_mission_monitor_worker, daemon=True, name="shark-mission-monitor"
+        ).start()
     if SHARKIQ_OK and not os.environ.get("SHARK_SKIP_AUTOLOAD"):
         try:
             _try_autoload()
