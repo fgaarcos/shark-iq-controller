@@ -253,11 +253,16 @@ def _finish_active_mission(result="completed", mode=None, error_code=None):
 
 def _sync_active_mission(mode, error_code=None):
     """Actualiza el seguimiento usando el estado real informado por el robot."""
-    row = _active_cleaning_mission()
-    if row is None:
-        return
     cleaning_modes = {"START", "CLEAN", "CLEANING", "MOP", "VACUUM", "VACUUM_AND_MOP"}
     terminal_modes = {"STOP", "RETURN", "RECHARGING"}
+    row = _active_cleaning_mission()
+    if row is None and mode in cleaning_modes:
+        _create_cleaning_mission(
+            "external", "Limpieza iniciada desde otro dispositivo", []
+        )
+        row = _active_cleaning_mission()
+    if row is None:
+        return
     if mode in cleaning_modes:
         with _schedule_lock, _schedule_db() as conn:
             conn.execute("""
@@ -436,10 +441,10 @@ def _schedule_worker():
 
 
 def _mission_monitor_worker():
-    """Consulta el robot solo mientras hay una limpieza iniciada por esta app."""
+    """Detecta limpiezas iniciadas desde la app, Shark o asistentes de voz."""
     while True:
         try:
-            if _state.get("authed") and _active_cleaning_mission() is not None:
+            if _state.get("authed"):
                 _refresh_state()
         except Exception as exc:
             print(f"[MISSION] Error: {exc}", flush=True)
@@ -2523,7 +2528,7 @@ function renderNotifications(unreadCount){
   badge.classList.toggle('show', unreadCount > 0);
   const host = document.getElementById('notificationList');
   if(!S.notifications.length){
-    host.innerHTML = '<div class="notification-empty">Las tareas terminadas aparecerán aquí.</div>';
+    host.innerHTML = '<div class="notification-empty">Las nuevas tareas terminadas aparecerán aquí, incluso si se iniciaron desde Shark o Google Home.</div>';
     return;
   }
   host.innerHTML = S.notifications.map(item=>`
