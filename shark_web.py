@@ -80,6 +80,8 @@ _state = {
     "pkce_redirect_uri": None,  # redirect URI usado en el último /auth/launch
     "mop_attached": None,    # GET_MopPlateAttached
     "power_mode": None,      # PowerModes: 1=Eco, 0=Normal, 2=Máxima
+    "mission_complete": None,
+    "docked": None,
 }
 _state_lock = threading.Lock()
 _schedule_lock = threading.Lock()
@@ -163,6 +165,15 @@ def _init_schedule_db():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_notifications_created
             ON notifications(created_at DESC)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS robot_monitor_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                mode TEXT,
+                mission_complete INTEGER,
+                docked INTEGER,
+                observed_at TEXT NOT NULL
+            )
         """)
 
 
@@ -251,28 +262,78 @@ def _finish_active_mission(result="completed", mode=None, error_code=None):
     return notification_id
 
 
-def _sync_active_mission(mode, error_code=None):
+def _monitor_state():
+    with _schedule_lock, _schedule_db() as conn:
+        return conn.execute(
+            "SELECT * FROM robot_monitor_state WHERE id=1"
+        ).fetchone()
+
+
+def _save_monitor_state(mode, mission_complete, docked):
+    now_iso = datetime.now(SCHEDULE_TZ).isoformat()
+    mission_value = None if mission_complete is None else int(bool(mission_complete))
+    docked_value = None if docked is None else int(bool(docked))
+    with _schedule_lock, _schedule_db() as conn:
+        conn.execute("""
+            INSERT INTO robot_monitor_state
+                (id, mode, mission_complete, docked, observed_at)
+            VALUES (1, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                mode=excluded.mode,
+                mission_complete=excluded.mission_complete,
+                docked=excluded.docked,
+                observed_at=excluded.observed_at
+        """, (mode, mission_value, docked_value, now_iso))
+
+
+def _sync_active_mission(mode, error_code=None, mission_complete=None, docked=None):
     """Actualiza el seguimiento usando el estado real informado por el robot."""
     cleaning_modes = {"START", "CLEAN", "CLEANING", "MOP", "VACUUM", "VACUUM_AND_MOP"}
     terminal_modes = {"STOP", "RETURN", "RECHARGING"}
+    previous = _monitor_state()
     row = _active_cleaning_mission()
-    if row is None and mode in cleaning_modes:
+    running_signal = (
+        mode in cleaning_modes
+        or (mission_complete is False and docked is not True)
+    )
+    completion_transition = bool(
+        previous is not None
+        and previous["mission_complete"] == 0
+        and mission_complete is True
+    )
+
+    if row is None and (running_signal or completion_transition):
         _create_cleaning_mission(
             "external", "Limpieza iniciada desde otro dispositivo", []
         )
         row = _active_cleaning_mission()
     if row is None:
+        _save_monitor_state(mode, mission_complete, docked)
         return
-    if mode in cleaning_modes:
+    if running_signal or completion_transition:
         with _schedule_lock, _schedule_db() as conn:
             conn.execute("""
                 UPDATE cleaning_missions
                    SET status='running', seen_running=1, last_mode=?
                  WHERE id=?
             """, (mode, row["id"]))
-    elif mode in terminal_modes and row["seen_running"]:
+
+    should_finish = bool(
+        row["seen_running"]
+        and (
+            completion_transition
+            or (mission_complete is True and (docked is True or mode in terminal_modes))
+            or (mission_complete is None and mode in terminal_modes)
+        )
+    )
+    # completion_transition puede haber creado la misión en esta misma lectura.
+    if completion_transition:
+        row = _active_cleaning_mission()
+        should_finish = row is not None
+    if should_finish:
         result = "error" if error_code not in (None, 0, "0", "") else "completed"
         _finish_active_mission(result, mode, error_code)
+    _save_monitor_state(mode, mission_complete, docked)
 
 
 def _list_notifications(limit=50):
@@ -619,6 +680,26 @@ MODE_MAP = {
 }
 
 
+def _read_bool_property(vac, *property_names):
+    for property_name in property_names:
+        try:
+            value = vac.get_property_value(property_name)
+        except Exception:
+            continue
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        normalized = str(value).strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off", ""):
+            return False
+    return None
+
+
 def _resolve_mode(vac):
     """Devuelve (mode_key, mode_text, mode_color, battery)."""
     battery = None
@@ -642,8 +723,10 @@ def _resolve_mode(vac):
 
     # Sobrescribir con estado de carga real
     try:
-        charging = vac.get_property_value("GET_Charging_Status")
-        docked   = vac.get_property_value("GET_Docked_Status")
+        charging = _read_bool_property(vac, "GET_Charging_Status", "Charging_Status")
+        docked = _read_bool_property(
+            vac, "GET_DockedStatus", "GET_Docked_Status", "DockedStatus"
+        )
         if (charging or docked) and mode_name in ("RETURN", "STOP", "UNKNOWN"):
             mode_name = "RECHARGING"
     except Exception:
@@ -683,6 +766,13 @@ def _refresh_state():
                         break
                 except Exception:
                     pass
+        mission_complete = _read_bool_property(
+            vac, "GET_MissionComplete", "MissionComplete",
+            "GET_CleanComplete", "CleanComplete",
+        )
+        docked = _read_bool_property(
+            vac, "GET_DockedStatus", "GET_Docked_Status", "DockedStatus"
+        )
         # Leer estado de la almohadilla
         mop_attached = None
         try:
@@ -709,7 +799,12 @@ def _refresh_state():
             _state["battery"]     = battery
             _state["mop_attached"] = mop_attached
             _state["power_mode"]   = power_mode
-        _sync_active_mission(mode_key, error_code)
+            _state["mission_complete"] = mission_complete
+            _state["docked"] = docked
+        _sync_active_mission(
+            mode_key, error_code,
+            mission_complete=mission_complete, docked=docked,
+        )
     except Exception as e:
         pass
 
@@ -1430,6 +1525,8 @@ def api_status():
         "name":        vac.name,
         "mop_attached": _state.get("mop_attached"),
         "power_mode":   _state.get("power_mode"),
+        "mission_complete": _state.get("mission_complete"),
+        "docked": _state.get("docked"),
     })
 
 
@@ -1583,6 +1680,24 @@ def api_notifications():
         })
     except (TypeError, ValueError):
         return jsonify({"ok": False, "msg": "Límite inválido"}), 400
+
+
+@app.route("/api/notifications/test", methods=["POST"])
+def api_notification_test():
+    if not _state["authed"]:
+        return jsonify({"ok": False, "msg": "No autenticado"}), 401
+    now_iso = datetime.now(SCHEDULE_TZ).isoformat()
+    notification_id = uuid.uuid4().hex
+    with _schedule_lock, _schedule_db() as conn:
+        conn.execute("""
+            INSERT INTO notifications
+                (id, mission_id, kind, title, message, created_at)
+            VALUES (?, NULL, 'success', ?, ?, ?)
+        """, (
+            notification_id, "Aviso de prueba",
+            "El centro de notificaciones está funcionando correctamente.", now_iso,
+        ))
+    return jsonify({"ok": True, "notification_id": notification_id}), 201
 
 
 @app.route("/api/notifications/<notification_id>/read", methods=["POST"])
@@ -2357,6 +2472,7 @@ body{background:#070D18;color:#E8F3FF;font-family:'Segoe UI',system-ui,sans-seri
     <div class="notification-head">
       <div class="notification-title">Notificaciones</div>
       <div class="notification-actions">
+        <button class="btn-sm" style="width:auto;padding:9px" onclick="sendTestNotification()">Probar</button>
         <button class="btn-sm" style="width:auto;padding:9px" onclick="markAllNotificationsRead()">Leer todas</button>
         <button class="btn-sm" style="width:auto;padding:9px 12px" onclick="closeNotifications()">✕</button>
       </div>
@@ -2565,6 +2681,12 @@ async function markNotificationRead(id){
 
 async function markAllNotificationsRead(){
   await api('/api/notifications/read-all','POST');
+  await loadNotifications();
+}
+
+async function sendTestNotification(){
+  const result = await api('/api/notifications/test','POST');
+  if(!result.ok){ alert(result.msg || 'No se pudo crear el aviso de prueba'); return; }
   await loadNotifications();
 }
 
